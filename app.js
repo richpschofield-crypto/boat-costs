@@ -3,7 +3,7 @@
 (() => {
 'use strict';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const API = String((window.BOAT_CONFIG && window.BOAT_CONFIG.apiUrl) || '').replace(/\/+$/, '');
 const LOCK_AFTER_MS = 5 * 60 * 1000;     // lock again after 5 minutes in the background
 const POLL_MS = 30 * 1000;               // check for the other phone's changes every 30 s
@@ -89,6 +89,8 @@ const S = {
   cats: {}, spends: {}, photos: {}, seq: 0,
   outbox: [],
   filter: { q: '', cat: '', from: '', to: '', est: false },
+  view: 'list',            // 'list' or 'dash'
+  dashYear: new Date().getFullYear(),
   sync: { busy: false, last: 0, error: '', offline: !navigator.onLine },
   hiddenAt: 0,
 };
@@ -362,13 +364,24 @@ function renderShell() {
         <button class="pill" id="status"><span class="dot"></span><span class="txt">…</span></button>
         <button class="icon-btn" id="settingsBtn" aria-label="Settings">${I.gear}</button>
       </div>
-      <div class="search-row">
+      <div class="tabs" role="tablist">
+        <button role="tab" data-view="list">Spends</button>
+        <button role="tab" data-view="dash">Dashboard</button>
+      </div>
+      <div class="search-row" id="searchRow">
         <label class="search">${I.search}<input id="q" type="search" placeholder="Search spends" autocomplete="off" enterkeyhint="search"></label>
         <button class="filter-btn" id="filterBtn" aria-label="Filter">${I.filter}<span>Filter</span></button>
       </div>
     </header>
     <main id="list"></main>
+    <main id="dash" class="dash hidden"></main>
     <button class="fab" id="addBtn">${I.plus}<span>Add spend</span></button>`;
+  document.querySelector('.tabs').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-view]');
+    if (b) setView(b.dataset.view);
+  });
+  setupDash();
+  setView(S.view, true);
   const q = document.getElementById('q');
   q.value = S.filter.q;
   q.addEventListener('input', () => { S.filter.q = q.value; renderList(); });
@@ -411,7 +424,7 @@ function filteredSpends() {
   const f = S.filter;
   const q = f.q.trim().toLowerCase();
   return Object.values(S.spends).filter((s) => {
-    if (f.cat && s.category_id !== f.cat) return false;
+    if (f.cat === '__none' ? !!s.category_id : (f.cat && s.category_id !== f.cat)) return false;
     if (f.from && s.date < f.from) return false;
     if (f.to && s.date > f.to) return false;
     if (f.est && !s.estimated) return false;
@@ -426,6 +439,10 @@ function filteredSpends() {
 function filterActive() { const f = S.filter; return !!(f.cat || f.from || f.to || f.est); }
 
 function renderList() {
+  if (S.view === 'dash') renderDash(); else renderSpendList();
+}
+
+function renderSpendList() {
   const el = document.getElementById('list');
   if (!el) return;
   const fb = document.getElementById('filterBtn');
@@ -471,6 +488,400 @@ function renderList() {
     html += `</div>`;
   });
   el.innerHTML = html;
+}
+
+// ---------------------------------------------------------------- views
+function setView(view, initial) {
+  S.view = view === 'dash' ? 'dash' : 'list';
+  pref.set('view', S.view);
+  document.querySelectorAll('.tabs [data-view]').forEach((b) => {
+    const on = b.dataset.view === S.view;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  const dash = S.view === 'dash';
+  document.getElementById('list').classList.toggle('hidden', dash);
+  document.getElementById('dash').classList.toggle('hidden', !dash);
+  document.getElementById('searchRow').classList.toggle('hidden', dash);
+  document.getElementById('addBtn').classList.toggle('hidden', dash);
+  if (!initial) { window.scrollTo(0, 0); renderList(); }
+}
+
+// Jump from the dashboard to the spend list with a filter applied.
+function showSpends(filter) {
+  Object.assign(S.filter, { q: '', cat: '', from: '', to: '', est: false }, filter);
+  const q = document.getElementById('q');
+  if (q) q.value = '';
+  setView('list');
+}
+
+// ---------------------------------------------------------------- dashboard
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const wholePounds = (p) => '£' + Math.round((p || 0) / 100).toLocaleString('en-GB');
+const shortPounds = (p) => {
+  const v = (p || 0) / 100;
+  if (v >= 1000) return '£' + (v / 1000).toLocaleString('en-GB', { maximumFractionDigits: v >= 10000 ? 0 : 1 }) + 'k';
+  return '£' + Math.round(v).toLocaleString('en-GB');
+};
+const sumP = (list) => list.reduce((t, s) => t + (s.amount_pence || 0), 0);
+const allSpends = () => Object.values(S.spends);
+const yearOf = (s) => +s.date.slice(0, 4);
+
+function niceScale(max) {
+  if (max <= 0) return { top: 10000, step: 2500 };
+  const raw = max / 4;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= raw);
+  return { step, top: Math.ceil(max / step) * step };
+}
+
+function dashYears() {
+  const ys = new Set(allSpends().map(yearOf));
+  ys.add(new Date().getFullYear());
+  return [...ys].sort((a, b) => b - a);
+}
+
+let dashResize = null;
+function setupDash() {
+  const el = document.getElementById('dash');
+  el.addEventListener('click', (e) => {
+    const t = e.target.closest('[data-act]');
+    if (!t) return;
+    const y = S.dashYear;
+    const yr = { from: `${y}-01-01`, to: `${y}-12-31` };
+    const act = t.dataset.act;
+    if (act === 'cat') showSpends(Object.assign({ cat: t.dataset.cat }, yr));
+    else if (act === 'est') showSpends(Object.assign({ est: true }, yr));
+    else if (act === 'spend') openEdit(t.dataset.id);
+    else if (act === 'yearcell') showSpends({ cat: t.dataset.cat || '', from: `${t.dataset.y}-01-01`, to: `${t.dataset.y}-12-31` });
+    else if (act === 'export') openExport();
+    else if (act === 'add') openEdit(null);
+  });
+  el.addEventListener('change', (e) => {
+    if (e.target.id === 'dashYear') { S.dashYear = +e.target.value; renderDash(); }
+  });
+  if ('ResizeObserver' in window) {
+    let w = 0;
+    new ResizeObserver((entries) => {
+      const nw = Math.round(entries[0].contentRect.width);
+      if (nw === w) return;
+      w = nw;
+      clearTimeout(dashResize);
+      dashResize = setTimeout(() => { if (S.view === 'dash') drawMonthChart(); }, 80);
+    }).observe(el);
+  }
+}
+
+function renderDash() {
+  const el = document.getElementById('dash');
+  if (!el) return;
+  const all = allSpends();
+  const years = dashYears();
+  if (!years.includes(S.dashYear)) S.dashYear = years[0];
+  const y = S.dashYear;
+  const now = new Date();
+  const thisYear = now.getFullYear();
+  const todayStr = today();
+
+  if (!all.length) {
+    el.innerHTML = `<div class="empty"><h2>Nothing to show yet</h2>Add some spends on your phone and the dashboard fills in here.</div>`;
+    return;
+  }
+
+  const inYear = all.filter((s) => yearOf(s) === y);
+  const yearTotal = sumP(inYear);
+
+  // Comparison tile: same point last year for the current year, full previous year otherwise.
+  let cmpLabel, cmpTotal, curForCmp;
+  if (y === thisYear) {
+    const cutoff = `${y - 1}-${todayStr.slice(5)}`;
+    cmpTotal = sumP(all.filter((s) => yearOf(s) === y - 1 && s.date <= cutoff));
+    curForCmp = sumP(inYear.filter((s) => s.date <= todayStr));
+    cmpLabel = `By ${now.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })} ${y - 1}`;
+  } else {
+    cmpTotal = sumP(all.filter((s) => yearOf(s) === y - 1));
+    curForCmp = yearTotal;
+    cmpLabel = `Full year ${y - 1}`;
+  }
+  const diff = curForCmp - cmpTotal;
+  let cmpNote;
+  if (!cmpTotal) cmpNote = `No spends logged for ${y - 1}`;
+  else {
+    const pct = Math.round((diff / cmpTotal) * 100);
+    cmpNote = diff === 0 ? 'Same as this year' : `${y} is ${wholePounds(Math.abs(diff))} ${diff > 0 ? 'higher' : 'lower'} (${diff > 0 ? '+' : '−'}${Math.abs(pct)}%)`;
+  }
+
+  const yearAgo = (() => { const d = new Date(); d.setFullYear(d.getFullYear() - 1); d.setDate(d.getDate() + 1); return isoDate(d); })();
+  const last12 = sumP(all.filter((s) => s.date >= yearAgo && s.date <= todayStr));
+  const allTime = sumP(all);
+  const firstYear = Math.min(...all.map(yearOf));
+
+  // By category for the chosen year
+  const byCat = new Map();
+  inYear.forEach((s) => { const k = s.category_id || '__none'; byCat.set(k, (byCat.get(k) || 0) + s.amount_pence); });
+  const catRows = [...byCat.entries()].sort((a, b) => b[1] - a[1]);
+  const catMax = catRows.length ? catRows[0][1] : 0;
+
+  // Biggest spends
+  const top = inYear.slice().sort((a, b) => b.amount_pence - a.amount_pence || b.date.localeCompare(a.date)).slice(0, 10);
+
+  // Estimated
+  const est = inYear.filter((s) => s.estimated);
+  const estTotal = sumP(est);
+  const estShare = yearTotal ? estTotal / yearTotal : 0;
+
+  // Year-on-year table
+  const tableYears = years.slice().sort((a, b) => a - b);
+  const cell = new Map(); // `${cat}|${year}` -> {p, est}
+  const catAll = new Map();
+  all.forEach((s) => {
+    const k = (s.category_id || '__none') + '|' + yearOf(s);
+    const c = cell.get(k) || { p: 0, est: false };
+    c.p += s.amount_pence; if (s.estimated) c.est = true;
+    cell.set(k, c);
+    catAll.set(s.category_id || '__none', (catAll.get(s.category_id || '__none') || 0) + s.amount_pence);
+  });
+  const tableCats = [...catAll.entries()].sort((a, b) => b[1] - a[1]).map(([k]) => k);
+  const yearTot = (yy) => { let p = 0, e = false; tableCats.forEach((c) => { const v = cell.get(c + '|' + yy); if (v) { p += v.p; e = e || v.est; } }); return { p, est: e }; };
+  const anyEstInTable = [...cell.values()].some((c) => c.est);
+  const estMark = (flag) => (flag ? '<span class="est-dot" title="Includes estimated costs">•</span>' : '');
+
+  el.innerHTML = `
+    <div class="dash-bar">
+      <label class="year-pick"><span>Year</span>
+        <select id="dashYear">${years.map((yy) => `<option value="${yy}" ${yy === y ? 'selected' : ''}>${yy}</option>`).join('')}</select>
+      </label>
+      <button class="mini" data-act="export">Export CSV</button>
+    </div>
+
+    <section class="tiles">
+      <div class="tile hero">
+        <div class="t-label">Spent in ${y}${y === thisYear ? ' so far' : ''}</div>
+        <div class="t-value num">${money(yearTotal)}</div>
+        <div class="t-note">${inYear.length} spend${inYear.length === 1 ? '' : 's'}</div>
+      </div>
+      <div class="tile">
+        <div class="t-label">${esc(cmpLabel)}</div>
+        <div class="t-value num">${money(cmpTotal)}</div>
+        <div class="t-note">${esc(cmpNote)}</div>
+      </div>
+      <div class="tile">
+        <div class="t-label">Last 12 months</div>
+        <div class="t-value num">${money(last12)}</div>
+        <div class="t-note">${esc(fmtDate(yearAgo))} to today</div>
+      </div>
+      <div class="tile">
+        <div class="t-label">All time</div>
+        <div class="t-value num">${money(allTime)}</div>
+        <div class="t-note">Since ${firstYear} · ${all.length} spend${all.length === 1 ? '' : 's'}</div>
+      </div>
+    </section>
+
+    <section class="dash-grid">
+      <div class="panel span-wide">
+        <div class="panel-head">
+          <h3>By month</h3>
+          <div class="legend"><span><i class="sw cur"></i>${y}</span><span><i class="sw prev"></i>${y - 1}</span></div>
+        </div>
+        <div class="chart" id="monthChart"></div>
+        <p class="panel-foot">Hover or tap a month for figures · click to see its spends</p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h3>By category</h3><span class="panel-sub">${y}</span></div>
+        ${catRows.length ? `<div class="cat-bars">${catRows.map(([k, p]) => `
+          <button class="cat-row" data-act="cat" data-cat="${esc(k)}">
+            <span class="cat-name">${esc(catName(k))}</span>
+            <span class="cat-track"><span class="cat-fill" style="width:${Math.max(1.5, (p / catMax) * 100).toFixed(1)}%"></span></span>
+            <span class="cat-val num">${money(p)}</span>
+            <span class="cat-pct num">${(p / yearTotal) * 100 < 1 ? '&lt;1' : Math.round((p / yearTotal) * 100)}%</span>
+          </button>`).join('')}</div>` : `<p class="muted-note">No spends in ${y}.</p>`}
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h3>Biggest spends</h3><span class="panel-sub">${y}</span></div>
+        ${top.length ? `<div class="top-list">${top.map((s, i) => `
+          <button class="top-row" data-act="spend" data-id="${esc(s.id)}">
+            <span class="top-rank num">${i + 1}</span>
+            <span class="top-main"><span class="top-title">${esc(s.description)}</span>
+              <span class="top-sub">${esc(fmtDate(s.date))} · ${esc(catName(s.category_id))}${s.supplier ? ' · ' + esc(s.supplier) : ''}</span></span>
+            ${s.estimated ? '<span class="tag-est">Est.</span>' : ''}
+            <span class="top-amt num">${money(s.amount_pence)}</span>
+          </button>`).join('')}</div>` : `<p class="muted-note">No spends in ${y}.</p>`}
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h3>How firm the numbers are</h3><span class="panel-sub">${y}</span></div>
+        ${est.length ? `
+          <p class="firm-line"><strong class="num">${money(estTotal)}</strong> of <strong class="num">${money(yearTotal)}</strong> is estimated</p>
+          <div class="firm-track" role="img" aria-label="${Math.round(estShare * 100)}% estimated"><span style="width:${Math.max(1.5, estShare * 100).toFixed(1)}%"></span></div>
+          <p class="firm-note">${est.length} estimated spend${est.length === 1 ? '' : 's'} · ${Math.round(estShare * 100)}% of the year</p>
+          <button class="mini" data-act="est">Show estimated spends</button>`
+        : inYear.length ? `<p class="firm-line">All ${y} figures are exact. Nothing is marked estimated.</p>` : `<p class="muted-note">No spends in ${y}.</p>`}
+      </div>
+
+      <div class="panel span-full">
+        <div class="panel-head"><h3>Year on year</h3><span class="panel-sub">by category</span></div>
+        <div class="table-wrap">
+          <table class="yoy">
+            <thead><tr><th>Category</th>${tableYears.map((yy) => `<th class="num${yy === y ? ' sel' : ''}">${yy}</th>`).join('')}<th class="num">Total</th></tr></thead>
+            <tbody>${tableCats.map((c) => {
+              let rowP = 0, rowE = false;
+              const tds = tableYears.map((yy) => {
+                const v = cell.get(c + '|' + yy);
+                if (v) { rowP += v.p; rowE = rowE || v.est; }
+                return v ? `<td class="num${yy === y ? ' sel' : ''}"><button class="cell-btn" data-act="yearcell" data-cat="${esc(c)}" data-y="${yy}">${money(v.p)}${estMark(v.est)}</button></td>` : `<td class="num dim${yy === y ? ' sel' : ''}">–</td>`;
+              }).join('');
+              return `<tr><th scope="row">${esc(catName(c))}</th>${tds}<td class="num strong">${money(rowP)}${estMark(rowE)}</td></tr>`;
+            }).join('')}</tbody>
+            <tfoot><tr><th scope="row">Total</th>${tableYears.map((yy) => { const t = yearTot(yy); return `<td class="num${yy === y ? ' sel' : ''}">${t.p ? `<button class="cell-btn" data-act="yearcell" data-cat="" data-y="${yy}">${money(t.p)}${estMark(t.est)}</button>` : '–'}</td>`; }).join('')}<td class="num">${money(allTime)}${estMark(anyEstInTable)}</td></tr></tfoot>
+          </table>
+        </div>
+        ${anyEstInTable ? `<p class="panel-foot"><span class="est-dot">•</span> includes estimated costs · click a figure to see its spends</p>` : `<p class="panel-foot">Click a figure to see its spends</p>`}
+      </div>
+    </section>`;
+  drawMonthChart();
+}
+
+function monthTotals(year) {
+  const m = new Array(12).fill(0);
+  allSpends().forEach((s) => { if (yearOf(s) === year) m[+s.date.slice(5, 7) - 1] += s.amount_pence; });
+  return m;
+}
+
+function drawMonthChart() {
+  const box = document.getElementById('monthChart');
+  if (!box) return;
+  const y = S.dashYear;
+  const cur = monthTotals(y), prev = monthTotals(y - 1);
+  const W = Math.max(280, box.clientWidth || 600);
+  const H = W < 500 ? 220 : 260;
+  const m = { l: 52, r: 8, t: 14, b: 28 };
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const { top, step } = niceScale(Math.max(...cur, ...prev));
+  const yv = (v) => m.t + ih - (v / top) * ih;
+  const band = iw / 12;
+  const bw = Math.max(3, Math.min(16, (band - 10) / 2));
+  const gap = 2;
+  const base = m.t + ih;
+  const bar = (x, v, cls) => {
+    if (v <= 0) return '';
+    const h = Math.max(1.5, base - yv(v));
+    const r = Math.min(4, bw / 2, h);
+    const yt = base - h;
+    return `<path class="${cls}" d="M${x},${base} V${yt + r} Q${x},${yt} ${x + r},${yt} H${x + bw - r} Q${x + bw},${yt} ${x + bw},${yt + r} V${base} Z"/>`;
+  };
+  let grid = '';
+  for (let v = 0; v <= top + 1e-6; v += step) {
+    const gy = yv(v).toFixed(1);
+    grid += `<line class="${v === 0 ? 'axis' : 'grid'}" x1="${m.l}" x2="${W - m.r}" y1="${gy}" y2="${gy}"/>` +
+      `<text class="tick" x="${m.l - 8}" y="${gy}" dy="0.32em" text-anchor="end">${shortPounds(v)}</text>`;
+  }
+  let bars = '', labels = '', hits = '';
+  const nowY = new Date().getFullYear(), nowM = new Date().getMonth();
+  for (let i = 0; i < 12; i++) {
+    const cx = m.l + i * band + band / 2;
+    bars += bar(cx - bw - gap / 2, prev[i], 'b-prev') + bar(cx + gap / 2, cur[i], 'b-cur');
+    const future = y === nowY && i > nowM;
+    labels += `<text class="mlabel${future ? ' future' : ''}" x="${cx}" y="${H - 8}" text-anchor="middle">${band < 30 ? MONTHS[i][0] : MONTHS[i]}</text>`;
+    hits += `<rect class="hit" data-m="${i}" x="${m.l + i * band}" y="${m.t}" width="${band}" height="${ih + m.b}"/>`;
+  }
+  box.innerHTML = `
+    <svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Spending by month, ${y} compared with ${y - 1}">
+      ${grid}
+      <rect class="col-hl" id="colHl" x="0" y="${m.t}" width="${band}" height="${ih}" rx="6" style="display:none"/>
+      ${bars}${labels}${hits}
+    </svg>
+    <div class="tip hidden" id="monthTip"></div>`;
+  const svgEl = box.querySelector('svg');
+  const tip = box.querySelector('#monthTip');
+  const hl = box.querySelector('#colHl');
+  const show = (i) => {
+    hl.setAttribute('x', m.l + i * band); hl.style.display = '';
+    tip.innerHTML = `<div class="tip-h">${MONTHS[i]}</div>
+      <div><i class="sw cur"></i>${y}<b class="num">${money(cur[i])}</b></div>
+      <div><i class="sw prev"></i>${y - 1}<b class="num">${money(prev[i])}</b></div>`;
+    tip.classList.remove('hidden');
+    const cx = m.l + i * band + band / 2;
+    const tw = tip.offsetWidth;
+    tip.style.left = Math.min(W - tw - 4, Math.max(4, cx - tw / 2)) + 'px';
+    tip.style.top = '4px';
+  };
+  const hide = () => { tip.classList.add('hidden'); hl.style.display = 'none'; };
+  svgEl.addEventListener('pointermove', (e) => { const r = e.target.closest('.hit'); if (r) show(+r.dataset.m); });
+  svgEl.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse') hide(); });
+  svgEl.addEventListener('click', (e) => {
+    const r = e.target.closest('.hit');
+    if (!r) return;
+    const i = +r.dataset.m;
+    // On touch: first tap shows the figures, second tap on the same month opens its spends.
+    if (e.pointerType !== 'mouse' && box.dataset.tapped !== String(i)) { box.dataset.tapped = String(i); show(i); return; }
+    box.dataset.tapped = '';
+    if (!cur[i]) { show(i); return; }
+    const mm = pad2(i + 1);
+    const last = new Date(y, i + 1, 0).getDate();
+    showSpends({ from: `${y}-${mm}-01`, to: `${y}-${mm}-${pad2(last)}` });
+  });
+}
+
+// ---------------------------------------------------------------- CSV export
+function csvCell(v) {
+  let s = v == null ? '' : String(v);
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;            // stop Excel treating text as a formula
+  return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+const ukDate = (iso) => `${iso.slice(8, 10)}/${iso.slice(5, 7)}/${iso.slice(0, 4)}`;
+const ukStamp = (ms) => { if (!ms) return ''; const d = new Date(ms); return `${ukDate(isoDate(d))} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`; };
+
+function exportCsv(year) {
+  const rows = allSpends()
+    .filter((s) => !year || yearOf(s) === year)
+    .sort((a, b) => a.date.localeCompare(b.date) || (a.created_at || 0) - (b.created_at || 0));
+  const head = ['Date', 'What', 'Supplier', 'Category', 'Cost (£)', 'Estimated', 'Notes', 'Receipt photos', 'Added by', 'Added on', 'Last changed by', 'Last changed on'];
+  const lines = [head.map(csvCell).join(',')];
+  rows.forEach((s) => {
+    const changed = s.updated_at && s.created_at && s.updated_at !== s.created_at;
+    lines.push([
+      ukDate(s.date), s.description, s.supplier || '', s.category_id ? catName(s.category_id) : '',
+      (s.amount_pence / 100).toFixed(2), s.estimated ? 'Yes' : 'No', s.notes || '', photosFor(s.id).length,
+      s.created_by || '', ukStamp(s.created_at), changed ? s.updated_by || '' : '', changed ? ukStamp(s.updated_at) : '',
+    ].map(csvCell).join(','));
+  });
+  const blob = new Blob(['﻿' + lines.join('\r\n') + '\r\n'], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `boat-costs-${year || 'all-years'}-${today()}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  toast(`Exported ${rows.length} spend${rows.length === 1 ? '' : 's'}`);
+}
+
+function openExport() {
+  const y = S.dashYear;
+  const nYear = allSpends().filter((s) => yearOf(s) === y).length;
+  const nAll = allSpends().length;
+  const d = document.createElement('div');
+  d.className = 'sheet';
+  d.style.cssText = 'z-index:45;background:rgba(10,20,28,.45);justify-content:flex-end;';
+  d.innerHTML = `<div style="background:var(--bg);border-radius:18px 18px 0 0;padding:20px 16px calc(var(--safe-bottom) + 20px)">
+      <div style="max-width:560px;margin:0 auto">
+        <h3 style="margin:0 0 6px;font-size:18px;text-align:center">Export to CSV</h3>
+        <p style="margin:0 0 18px;color:var(--muted);text-align:center">Opens in Excel. Costs are in pounds; dates are day/month/year.</p>
+        <button class="btn primary" data-x="year" ${nYear ? '' : 'disabled'}>${y} only (${nYear} spend${nYear === 1 ? '' : 's'})</button>
+        <button class="btn plain" data-x="all">All years (${nAll} spend${nAll === 1 ? '' : 's'})</button>
+        <button class="btn plain" data-x="cancel">Cancel</button>
+      </div></div>`;
+  d.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-x]');
+    if (b && b.disabled) return;
+    if (b || e.target === d) d.remove();
+    if (b && b.dataset.x === 'year') exportCsv(y);
+    if (b && b.dataset.x === 'all') exportCsv(0);
+  });
+  document.body.appendChild(d);
 }
 
 // ---------------------------------------------------------------- sheets
@@ -773,6 +1184,7 @@ function openFilter() {
       <div class="group">
         <div class="field"><select id="ffCat"><option value="">All categories</option>
           ${sortedCats(true).map((c) => `<option value="${esc(c.id)}" ${c.id === f.cat ? 'selected' : ''}>${esc(c.name)}${c.hidden ? ' (hidden)' : ''}</option>`).join('')}
+          <option value="__none" ${f.cat === '__none' ? 'selected' : ''}>No category</option>
         </select></div>
       </div>
       <div class="group">
@@ -882,6 +1294,7 @@ setInterval(() => { if (S.unlocked && document.visibilityState === 'visible') sy
 async function start() {
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
   await loadLocal();
+  S.view = pref.get('view', 'list') === 'dash' ? 'dash' : 'list';
   S.auth = readAuth();
   if (S.auth && S.auth.token && S.auth.hash) showLock('unlock');
   else showLock('signin', S.auth ? 'Please sign in again with your passcode.' : '');
