@@ -3,7 +3,7 @@
 (() => {
 'use strict';
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const API = String((window.BOAT_CONFIG && window.BOAT_CONFIG.apiUrl) || '').replace(/\/+$/, '');
 const LOCK_AFTER_MS = 5 * 60 * 1000;     // lock again after 5 minutes in the background
 const POLL_MS = 30 * 1000;               // check for the other phone's changes every 30 s
@@ -22,6 +22,7 @@ const I = {
   camera: svg('<path d="M4 8h3l2-3h6l2 3h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1Z"/><circle cx="12" cy="13.5" r="3.5"/>'),
   clip: svg('<path d="m21 11-8.5 8.5a5 5 0 0 1-7-7L14 4a3.5 3.5 0 0 1 5 5l-8.5 8.5a2 2 0 0 1-3-3L15 7"/>'),
   clock: svg('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'),
+  doc: svg('<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z"/><path d="M14 3v5h5"/>'),
 };
 
 // ---------------------------------------------------------------- small utils
@@ -837,7 +838,7 @@ function exportCsv(year) {
   const rows = allSpends()
     .filter((s) => !year || yearOf(s) === year)
     .sort((a, b) => a.date.localeCompare(b.date) || (a.created_at || 0) - (b.created_at || 0));
-  const head = ['Date', 'What', 'Supplier', 'Category', 'Cost (£)', 'Estimated', 'Notes', 'Receipt photos', 'Added by', 'Added on', 'Last changed by', 'Last changed on'];
+  const head = ['Date', 'What', 'Supplier', 'Category', 'Cost (£)', 'Estimated', 'Notes', 'Receipts & bills', 'Added by', 'Added on', 'Last changed by', 'Last changed on'];
   const lines = [head.map(csvCell).join(',')];
   rows.forEach((s) => {
     const changed = s.updated_at && s.created_at && s.updated_at !== s.created_at;
@@ -967,7 +968,22 @@ async function photoBlob(id) {
   return blob;
 }
 
+const MAX_PDF_BYTES = 5_000_000;
+const isPdfBlob = (b) => !!b && (b.type === 'application/pdf');
+const fmtSize = (n) => (n >= 1e6 ? (n / 1e6).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1e3)) + ' KB');
+
+function openPdfViewer(blob) {
+  const url = URL.createObjectURL(blob);
+  const v = document.createElement('div');
+  v.className = 'viewer pdf';
+  v.innerHTML = `<iframe src="${url}" title="PDF"></iframe>
+    <div class="pdf-bar"><a class="pdf-open" href="${url}" target="_blank" rel="noopener">Open full PDF</a><button class="pdf-close">Close</button></div>`;
+  v.querySelector('.pdf-close').onclick = () => { v.remove(); setTimeout(() => URL.revokeObjectURL(url), 60000); };
+  document.body.appendChild(v);
+}
+
 function openViewer(blob) {
+  if (isPdfBlob(blob)) { openPdfViewer(blob); return; }
   const url = URL.createObjectURL(blob);
   const v = document.createElement('div');
   v.className = 'viewer';
@@ -985,7 +1001,7 @@ function openEdit(id) {
     category_id: S.cats[pref.get('lastCat', '')] && !S.cats[pref.get('lastCat', '')].hidden ? pref.get('lastCat', '') : '',
     notes: '', estimated: 0,
   };
-  const form = { photos: photosFor(s.id).map((p) => ({ id: p.id, existing: true, removed: false })) };
+  const form = { photos: photosFor(s.id).map((p) => ({ id: p.id, existing: true, removed: false, pdf: p.mime === 'application/pdf', size: p.size })) };
   const urls = [];
   sheetCleanup.push(() => urls.forEach((u) => URL.revokeObjectURL(u)));
 
@@ -1032,9 +1048,9 @@ function openEdit(id) {
         <label class="toggle"><span class="t-text">Estimated<small>Not sure of the exact figure</small></span>
           <span class="switch"><input type="checkbox" id="fEst" ${s.estimated ? 'checked' : ''}><span></span></span></label>
       </div>
-      <div class="group-title">Receipt photos</div>
+      <div class="group-title">Receipts &amp; bills</div>
       <div class="group"><div class="photos" id="fPhotos"></div></div>
-      <input type="file" id="fFile" accept="image/*" multiple class="hidden">
+      <input type="file" id="fFile" accept="image/*,application/pdf,.pdf" multiple class="hidden">
       <div class="group">
         <div class="field"><label for="fNotes">Notes</label>
           <textarea id="fNotes" placeholder="Optional">${esc(s.notes)}</textarea></div>
@@ -1052,10 +1068,11 @@ function openEdit(id) {
 
   const drawPhotos = () => {
     const box = $('#fPhotos');
-    box.innerHTML = form.photos.filter((p) => !p.removed).map((p) => `
-      <div class="thumb" data-ph="${esc(p.id)}"><div class="ph">Loading…</div><button class="x" data-rm="${esc(p.id)}" aria-label="Remove photo">×</button></div>`).join('') +
-      `<button class="add-photo" id="fAddPh">${I.camera}<span>Add photo</span></button>`;
-    form.photos.filter((p) => !p.removed).forEach(async (p) => {
+    box.innerHTML = form.photos.filter((p) => !p.removed).map((p) => p.pdf
+      ? `<div class="thumb pdf-thumb" data-ph="${esc(p.id)}">${I.doc}<span>PDF</span><small>${p.size ? fmtSize(p.size) : ''}</small><button class="x" data-rm="${esc(p.id)}" aria-label="Remove PDF">×</button></div>`
+      : `<div class="thumb" data-ph="${esc(p.id)}"><div class="ph">Loading…</div><button class="x" data-rm="${esc(p.id)}" aria-label="Remove photo">×</button></div>`).join('') +
+      `<button class="add-photo" id="fAddPh">${I.camera}<span>Photo or PDF</span></button>`;
+    form.photos.filter((p) => !p.removed && !p.pdf).forEach(async (p) => {
       const holder = box.querySelector(`[data-ph="${CSS.escape(p.id)}"]`);
       try {
         const blob = p.blob || (await photoBlob(p.id));
@@ -1073,12 +1090,29 @@ function openEdit(id) {
     if (rm) { e.stopPropagation(); const p = form.photos.find((x) => x.id === rm.dataset.rm); if (p) p.removed = true; drawPhotos(); return; }
     if (e.target.closest('#fAddPh')) { $('#fFile').click(); return; }
     const th = e.target.closest('[data-ph]');
-    if (th) { const p = form.photos.find((x) => x.id === th.dataset.ph); if (p && p.view) openViewer(p.view); }
+    if (th) {
+      const p = form.photos.find((x) => x.id === th.dataset.ph);
+      if (!p) return;
+      if (p.pdf) {
+        try {
+          const blob = p.blob || (await photoBlob(p.id));
+          if (!blob) throw new Error();
+          openPdfViewer(blob.type === 'application/pdf' ? blob : new Blob([blob], { type: 'application/pdf' }));
+        } catch { toast('This PDF needs signal to open the first time'); }
+      } else if (p.view) openViewer(p.view);
+    }
   });
   $('#fFile').onchange = async (e) => {
     const files = [...e.target.files];
     e.target.value = '';
     for (const f of files) {
+      const pdf = f.type === 'application/pdf' || /\.pdf$/i.test(f.name || '');
+      if (pdf) {
+        if (f.size > MAX_PDF_BYTES) { toast(`${f.name || 'That PDF'} is ${fmtSize(f.size)} — the limit is 5 MB`, 4000); continue; }
+        const blob = f.type === 'application/pdf' ? f : new Blob([f], { type: 'application/pdf' });
+        form.photos.push({ id: uid(), existing: false, pdf: true, size: f.size, blob });
+        continue;
+      }
       try { form.photos.push({ id: uid(), existing: false, blob: await compressImage(f) }); }
       catch (err) { toast(err.message); }
     }
@@ -1141,7 +1175,7 @@ function openEdit(id) {
     for (const p of form.photos) {
       if (!p.existing && !p.removed) {
         try { await idb.set('blobs', p.id, p.blob); } catch { toast('Could not store a photo on this phone'); continue; }
-        S.photos[p.id] = { id: p.id, spend_id: s.id, created_by: S.auth.user, created_at: Date.now(), pending: true };
+        S.photos[p.id] = { id: p.id, spend_id: s.id, mime: p.blob.type || 'image/jpeg', size: p.blob.size, created_by: S.auth.user, created_at: Date.now(), pending: true };
         queue({ t: 'photo', id: p.id, spend: s.id });
       } else if (p.existing && p.removed) {
         const unsent = S.outbox.findIndex((o) => o.t === 'photo' && o.id === p.id && !o.sending);
