@@ -1,6 +1,6 @@
-// Boat Costs service worker — lets the app open with no signal.
+// Boat Costs service worker — lets the app open with no signal, and shows reminder notifications.
 // Bump VERSION whenever app files change so phones pick up the new copy.
-const VERSION = 'boat-costs-1.2.0';
+const VERSION = 'boat-costs-1.3.0';
 const FILES = ['./', 'index.html', 'app.js', 'config.js', 'manifest.webmanifest',
                'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 
@@ -25,5 +25,27 @@ self.addEventListener('fetch', (e) => {
       return res;
     }).catch(() => cached);
     return cached || fresh;
+  }));
+});
+
+// ---- reminder notifications (sent by the Worker at 9am)
+self.addEventListener('push', (e) => {
+  let m = {};
+  try { m = e.data ? e.data.json() : {}; } catch { m = { title: 'Boat Costs', body: e.data ? e.data.text() : '' }; }
+  e.waitUntil(self.registration.showNotification(m.title || 'Boat Costs', {
+    body: m.body || '',
+    tag: m.tag || 'boat-costs',
+    icon: 'icon-192.png',
+    badge: 'icon-192.png',
+    data: { url: m.url || './#reminders' },
+  }));
+});
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  const target = (e.notification.data && e.notification.data.url) || './#reminders';
+  e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((wins) => {
+    const w = wins.find((c) => c.url.startsWith(self.registration.scope));
+    if (w) { w.postMessage({ open: 'reminders' }); return w.focus(); }
+    return self.clients.openWindow(target);
   }));
 });

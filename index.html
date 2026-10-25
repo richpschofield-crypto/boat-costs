@@ -212,7 +212,10 @@ main { padding: 12px 16px calc(var(--safe-bottom) + 96px); max-width: 720px; mar
 @media (prefers-color-scheme: dark) { .lock-actions .go { background: var(--accent); color: var(--on-accent); } }
 
 /* ---------- view switch ---------- */
-.tabs { display: flex; gap: 4px; margin-top: 10px; background: rgba(255,255,255,.12); border-radius: 12px; padding: 3px; max-width: 360px; }
+.tabs { display: flex; gap: 4px; margin-top: 10px; background: rgba(255,255,255,.12); border-radius: 12px; padding: 3px; max-width: 440px; }
+.tabs button { position: relative; white-space: nowrap; }
+.tab-badge { position: absolute; top: -5px; right: -2px; min-width: 18px; height: 18px; line-height: 18px; border-radius: 9px; background: var(--late); color: #fff; font-size: 11px; font-weight: 700; padding: 0 5px; box-shadow: 0 0 0 2px var(--accent); }
+@media (prefers-color-scheme: dark) { .tab-badge { color: #1a0d0c; box-shadow: 0 0 0 2px #14222d; } }
 .tabs button { flex: 1; border: 0; background: transparent; color: inherit; padding: 7px 10px; border-radius: 9px; font-weight: 600; font-size: 15px; opacity: .85; }
 .tabs button.on { background: var(--on-accent); color: var(--accent); opacity: 1; }
 @media (prefers-color-scheme: dark) { .tabs button.on { background: var(--accent); color: var(--on-accent); } }
@@ -319,6 +322,36 @@ main { padding: 12px 16px calc(var(--safe-bottom) + 96px); max-width: 720px; mar
   background: #16212b; color: #fff; padding: 10px 16px; border-radius: 12px; font-size: 15px; max-width: calc(100% - 32px);
   box-shadow: 0 6px 18px rgba(0,0,0,.25); animation: up .18s ease-out;
 }
+
+/* ---------- reminders ---------- */
+:root { --late: #b3261e; --late-soft: #fbe7e5; --soon: #9a5a14; --soon-soft: #fbf0e1; }
+@media (prefers-color-scheme: dark) { :root { --late: #ef8a83; --late-soft: #3a1c1a; --soon: #e0a45e; --soon-soft: #2d2216; } }
+.due-strip { margin: 0 0 14px; }
+.due-strip .strip-head { display: flex; justify-content: space-between; align-items: baseline; margin: 2px 2px 6px; font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
+.due-strip .strip-head button { border: 0; background: transparent; color: var(--accent); font-size: 14px; font-weight: 600; text-transform: none; letter-spacing: 0; padding: 0; }
+.rem-icon { width: 40px; height: 40px; flex: none; border-radius: 10px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent); }
+.rem-icon svg { width: 20px; height: 20px; }
+.rem-icon.late { background: var(--late-soft); color: var(--late); }
+.rem-icon.soon { background: var(--soon-soft); color: var(--soon); }
+.rem-icon.done { background: var(--bg); color: var(--ok); }
+.due-txt { font-size: 13px; font-weight: 600; white-space: nowrap; }
+.due-txt.late { color: var(--late); }
+.due-txt.soon { color: var(--soon); }
+.due-txt.later { color: var(--muted); font-weight: 400; }
+.row.is-late .row-title { color: var(--late); }
+.row.done-row .row-title { color: var(--muted); text-decoration: line-through; text-decoration-color: var(--faint); }
+.sec-title { margin: 18px 2px 6px; font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; display: flex; justify-content: space-between; }
+.sec-title:first-child { margin-top: 4px; }
+.sec-title.late { color: var(--late); }
+.seg { display: flex; gap: 4px; background: var(--bg); border-radius: 10px; padding: 3px; margin: 10px 14px; }
+.seg button { flex: 1; border: 0; background: transparent; padding: 8px; border-radius: 8px; font-weight: 600; font-size: 15px; color: var(--muted); }
+.seg button.on { background: var(--card); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+.every { display: flex; align-items: center; gap: 10px; }
+.every input { width: 70px !important; flex: none !important; text-align: center; border: 1px solid var(--line) !important; border-radius: 9px; padding: 6px 4px !important; background: var(--bg) !important; }
+.hint { color: var(--muted); font-size: 13px; padding: 0 14px 12px; margin: -4px 0 0; }
+.btn.done-btn { background: var(--ok); color: #fff; }
+@media (prefers-color-scheme: dark) { .btn.done-btn { color: #0c1a24; } }
+.note-box { background: var(--card); border-radius: var(--radius); padding: 12px 14px; color: var(--muted); font-size: 14px; margin-bottom: 14px; }
 </style>
 </head>
 <body>

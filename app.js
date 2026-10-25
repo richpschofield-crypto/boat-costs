@@ -1,9 +1,10 @@
-/* Boat Costs — phone app (stage 1)
-   Spends, categories, receipt photos, passcode lock, offline queue + sync. */
+/* Boat Costs — phone app
+   Spends, categories, receipt photos, passcode lock, offline queue + sync,
+   dashboard + CSV export, reminders with notifications and a calendar feed. */
 (() => {
 'use strict';
 
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 const API = String((window.BOAT_CONFIG && window.BOAT_CONFIG.apiUrl) || '').replace(/\/+$/, '');
 const LOCK_AFTER_MS = 5 * 60 * 1000;     // lock again after 5 minutes in the background
 const POLL_MS = 30 * 1000;               // check for the other phone's changes every 30 s
@@ -23,6 +24,9 @@ const I = {
   clip: svg('<path d="m21 11-8.5 8.5a5 5 0 0 1-7-7L14 4a3.5 3.5 0 0 1 5 5l-8.5 8.5a2 2 0 0 1-3-3L15 7"/>'),
   clock: svg('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'),
   doc: svg('<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z"/><path d="M14 3v5h5"/>'),
+  bell: svg('<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.9 1.9 0 0 0 3.4 0"/>'),
+  repeat: svg('<path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/>'),
+  check: svg('<path d="M20 6 9 17l-5-5"/>', 'stroke-width="2.6"'),
 };
 
 // ---------------------------------------------------------------- small utils
@@ -87,10 +91,10 @@ const idb = (() => {
 const S = {
   auth: null,          // { user, token, salt, hash, len }
   unlocked: false,
-  cats: {}, spends: {}, photos: {}, seq: 0,
+  cats: {}, spends: {}, photos: {}, reminders: {}, seq: 0,
   outbox: [],
   filter: { q: '', cat: '', from: '', to: '', est: false },
-  view: 'list',            // 'list' or 'dash'
+  view: 'list',            // 'list', 'rem' or 'dash'
   dashYear: new Date().getFullYear(),
   sync: { busy: false, last: 0, error: '', offline: !navigator.onLine },
   hiddenAt: 0,
@@ -111,7 +115,7 @@ let saveTimer = null;
 function saveData() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    idb.set('kv', 'data', { cats: S.cats, spends: S.spends, photos: S.photos, seq: S.seq }).catch(() => {});
+    idb.set('kv', 'data', { cats: S.cats, spends: S.spends, photos: S.photos, reminders: S.reminders, seq: S.seq }).catch(() => {});
   }, 250);
 }
 function saveOutbox() {
@@ -120,7 +124,9 @@ function saveOutbox() {
 async function loadLocal() {
   try {
     const d = await idb.get('kv', 'data');
-    if (d) Object.assign(S, { cats: d.cats || {}, spends: d.spends || {}, photos: d.photos || {}, seq: d.seq || 0 });
+    if (d) Object.assign(S, { cats: d.cats || {}, spends: d.spends || {}, photos: d.photos || {}, reminders: d.reminders || {}, seq: d.seq || 0 });
+    // Phones that synced before reminders existed need one full re-sync to pick them up.
+    if (d && !d.reminders) S.seq = 0;
     S.outbox = (await idb.get('kv', 'outbox')) || [];
   } catch (e) { /* private mode etc. — run from memory */ }
 }
@@ -160,7 +166,7 @@ async function api(method, path, body, { raw = false, timeout = 20000 } = {}) {
 function pendingIds() { return new Set(S.outbox.map((o) => o.id).concat(S.outbox.map((o) => o.spend).filter(Boolean))); }
 
 function queue(op) {
-  const i = S.outbox.findIndex((o) => !o.sending && o.t === op.t && o.id === op.id && (op.t === 'spend' || op.t === 'cat'));
+  const i = S.outbox.findIndex((o) => !o.sending && o.t === op.t && o.id === op.id && (op.t === 'spend' || op.t === 'cat' || op.t === 'rem'));
   if (i >= 0) S.outbox[i] = op; else S.outbox.push(op);
   saveOutbox();
 }
@@ -181,6 +187,11 @@ async function sendOp(op) {
     if (S.photos[op.id]) { delete S.photos[op.id].pending; saveData(); }
   } else if (op.t === 'delphoto') {
     await api('DELETE', '/photos/' + op.id);
+  } else if (op.t === 'rem') {
+    const row = await api('PUT', '/reminders/' + op.id, op.rec);
+    if (!S.outbox.some((o) => o !== op && o.id === op.id)) { S.reminders[op.id] = row; saveData(); }
+  } else if (op.t === 'remdel') {
+    await api('DELETE', '/reminders/' + op.id);
   }
 }
 
@@ -188,6 +199,9 @@ function rejected(op, e) {
   if (op.t === 'spend' && e.status === 409) {
     removeSpendLocally(op.id);
     toast('A spend you edited had been deleted on the other phone');
+  } else if (op.t === 'rem' && e.status === 409) {
+    delete S.reminders[op.id]; saveData();
+    toast('A reminder you edited had been deleted on the other phone');
   } else {
     toast('Could not save a change: ' + e.message, 4000);
   }
@@ -222,6 +236,10 @@ async function pull() {
   d.photos.forEach((p) => {
     if (p.deleted) { delete S.photos[p.id]; idb.del('blobs', p.id).catch(() => {}); }
     else S.photos[p.id] = Object.assign({}, S.photos[p.id], p, { pending: undefined });
+  });
+  (d.reminders || []).forEach((r) => {
+    if (r.deleted) { delete S.reminders[r.id]; S.outbox = S.outbox.filter((o) => o.id !== r.id || o.sending); }
+    else if (!pend.has(r.id)) S.reminders[r.id] = r;
   });
   S.seq = d.seq;
   saveData();
@@ -344,7 +362,7 @@ function unlock() {
   if (lockEl) { lockEl.remove(); lockEl = null; }
   if (!document.querySelector('.top')) renderShell();
   renderList(); renderStatus();
-  sync();
+  sync().then(refreshPush);
 }
 
 function lockNow() { closeSheet(); showLock('unlock'); }
@@ -367,6 +385,7 @@ function renderShell() {
       </div>
       <div class="tabs" role="tablist">
         <button role="tab" data-view="list">Spends</button>
+        <button role="tab" data-view="rem">Reminders<span class="tab-badge hidden" id="remBadge"></span></button>
         <button role="tab" data-view="dash">Dashboard</button>
       </div>
       <div class="search-row" id="searchRow">
@@ -375,6 +394,7 @@ function renderShell() {
       </div>
     </header>
     <main id="list"></main>
+    <main id="rem" class="hidden"></main>
     <main id="dash" class="dash hidden"></main>
     <button class="fab" id="addBtn">${I.plus}<span>Add spend</span></button>`;
   document.querySelector('.tabs').addEventListener('click', (e) => {
@@ -387,15 +407,22 @@ function renderShell() {
   q.value = S.filter.q;
   q.addEventListener('input', () => { S.filter.q = q.value; renderList(); });
   q.addEventListener('keydown', (e) => { if (e.key === 'Enter') q.blur(); });
-  document.getElementById('addBtn').onclick = () => openEdit(null);
+  document.getElementById('addBtn').onclick = () => (S.view === 'rem' ? openRem(null) : openEdit(null));
   document.getElementById('filterBtn').onclick = openFilter;
   document.getElementById('settingsBtn').onclick = openSettings;
   document.getElementById('status').onclick = () => { sync().then(() => toast(statusText().long)); };
   document.getElementById('list').addEventListener('click', (e) => {
     const chipX = e.target.closest('[data-unfilter]');
     if (chipX) { const k = chipX.dataset.unfilter; if (k === 'dates') { S.filter.from = ''; S.filter.to = ''; } else S.filter[k] = k === 'est' ? false : ''; if (k === 'q') document.getElementById('q').value = ''; renderList(); return; }
+    if (e.target.closest('[data-allrem]')) { setView('rem'); return; }
+    const rr = e.target.closest('[data-rem]');
+    if (rr) { openRem(rr.dataset.rem); return; }
     const row = e.target.closest('[data-id]');
     if (row) openEdit(row.dataset.id);
+  });
+  document.getElementById('rem').addEventListener('click', (e) => {
+    const rr = e.target.closest('[data-rem]');
+    if (rr) openRem(rr.dataset.rem);
   });
 }
 
@@ -440,7 +467,8 @@ function filteredSpends() {
 function filterActive() { const f = S.filter; return !!(f.cat || f.from || f.to || f.est); }
 
 function renderList() {
-  if (S.view === 'dash') renderDash(); else renderSpendList();
+  if (S.view === 'dash') renderDash(); else if (S.view === 'rem') renderRems(); else renderSpendList();
+  renderBadge();
 }
 
 function renderSpendList() {
@@ -460,6 +488,7 @@ function renderSpendList() {
   const total = list.reduce((t, s) => t + s.amount_pence, 0);
   let html = chips.length ? `<div class="chips">${chips.map(([k, l, v]) => `<span class="chip">${esc(l)}: <b>${esc(v)}</b><button data-unfilter="${k}" aria-label="Remove">×</button></span>`).join('')}</div>` : '';
 
+  if (!chips.length) html += dueStrip();
   if (!Object.keys(S.spends).length) {
     el.innerHTML = html + `<div class="empty"><h2>No spends yet</h2>Tap <b>Add spend</b> to log the first one.<br>You can add past spends with their original date.</div>`;
     return;
@@ -493,18 +522,21 @@ function renderSpendList() {
 
 // ---------------------------------------------------------------- views
 function setView(view, initial) {
-  S.view = view === 'dash' ? 'dash' : 'list';
+  S.view = ['dash', 'rem'].includes(view) ? view : 'list';
   pref.set('view', S.view);
   document.querySelectorAll('.tabs [data-view]').forEach((b) => {
     const on = b.dataset.view === S.view;
     b.classList.toggle('on', on);
     b.setAttribute('aria-selected', on ? 'true' : 'false');
   });
-  const dash = S.view === 'dash';
-  document.getElementById('list').classList.toggle('hidden', dash);
+  const dash = S.view === 'dash', rem = S.view === 'rem';
+  document.getElementById('list').classList.toggle('hidden', dash || rem);
+  document.getElementById('rem').classList.toggle('hidden', !rem);
   document.getElementById('dash').classList.toggle('hidden', !dash);
-  document.getElementById('searchRow').classList.toggle('hidden', dash);
-  document.getElementById('addBtn').classList.toggle('hidden', dash);
+  document.getElementById('searchRow').classList.toggle('hidden', dash || rem);
+  const add = document.getElementById('addBtn');
+  add.classList.toggle('hidden', dash);
+  add.querySelector('span').textContent = rem ? 'Add reminder' : 'Add spend';
   if (!initial) { window.scrollTo(0, 0); renderList(); }
 }
 
@@ -993,14 +1025,14 @@ function openViewer(blob) {
 }
 
 // ---------------------------------------------------------------- add / edit spend
-function openEdit(id) {
+function openEdit(id, prefill) {
   const existing = id ? S.spends[id] : null;
   if (id && !existing) return;
-  const s = existing || {
+  const s = existing || Object.assign({
     id: uid(), date: today(), description: '', supplier: '', amount_pence: null,
     category_id: S.cats[pref.get('lastCat', '')] && !S.cats[pref.get('lastCat', '')].hidden ? pref.get('lastCat', '') : '',
     notes: '', estimated: 0,
-  };
+  }, prefill || {});
   const form = { photos: photosFor(s.id).map((p) => ({ id: p.id, existing: true, removed: false, pdf: p.mime === 'application/pdf', size: p.size })) };
   const urls = [];
   sheetCleanup.push(() => urls.forEach((u) => URL.revokeObjectURL(u)));
@@ -1064,7 +1096,7 @@ function openEdit(id) {
   const $ = (sel) => sh.querySelector(sel);
   const catSel = $('#fCat');
   catSel.onchange = () => { $('#fNewCatW').classList.toggle('hidden', catSel.value !== '__new'); if (catSel.value === '__new') $('#fNewCat').focus(); };
-  if (!existing) setTimeout(() => $('#fDesc').focus(), 250);
+  if (!existing) setTimeout(() => $(prefill && prefill.description ? '#fAmt' : '#fDesc').focus(), 250);
 
   const drawPhotos = () => {
     const box = $('#fPhotos');
@@ -1192,6 +1224,298 @@ function openEdit(id) {
   }
 }
 
+// ---------------------------------------------------------------- reminders
+const daysUntil = (iso) => Math.round((parseISO(iso) - parseISO(today())) / 864e5);
+const shortDate = (iso) => parseISO(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+const daysIn = (y, m) => new Date(y, m + 1, 0).getDate();
+// Move a date on by n months, keeping the original day where the month allows (31 Jan -> 28 Feb -> 31 Mar).
+function addMonths(iso, n, anchor) {
+  const [y, m] = iso.split('-').map(Number);
+  const t = new Date(y, m - 1 + n, 1);
+  const day = Math.min(anchor || +iso.slice(8, 10), daysIn(t.getFullYear(), t.getMonth()));
+  return isoDate(new Date(t.getFullYear(), t.getMonth(), day));
+}
+const activeRems = () => Object.values(S.reminders).filter((r) => !r.done_at).sort((a, b) => a.due_date.localeCompare(b.due_date) || a.name.localeCompare(b.name));
+const everyText = (r) => (r.kind === 'repeat' ? (r.every_months === 12 ? 'Every year' : r.every_months % 12 === 0 ? `Every ${r.every_months / 12} years` : r.every_months === 1 ? 'Every month' : `Every ${r.every_months} months`) : 'One-off');
+function dueInfo(r) {
+  const d = daysUntil(r.due_date);
+  if (d < 0) return { cls: 'late', text: `${-d} day${d === -1 ? '' : 's'} overdue` };
+  if (d === 0) return { cls: 'late', text: 'Due today' };
+  if (d === 1) return { cls: 'soon', text: 'Due tomorrow' };
+  if (d <= 30) return { cls: 'soon', text: `Due in ${d} days` };
+  return { cls: 'later', text: shortDate(r.due_date) };
+}
+function remRow(r) {
+  const done = !!r.done_at;
+  const info = done ? { cls: 'later', text: 'Done ' + shortDate(isoDate(new Date(r.done_at))) } : dueInfo(r);
+  const sub = [r.category_id ? catName(r.category_id) : '', everyText(r)].filter(Boolean).map(esc).join(' · ');
+  const waiting = pendingIds().has(r.id);
+  return `<button class="row${info.cls === 'late' && !done ? ' is-late' : ''}${done ? ' done-row' : ''}" data-rem="${esc(r.id)}">
+    <div class="rem-icon ${done ? 'done' : info.cls}">${done ? I.check : r.kind === 'repeat' ? I.repeat : I.bell}</div>
+    <div class="row-main"><div class="row-title">${esc(r.name)}</div><div class="row-sub"><span>${sub}</span></div></div>
+    <div class="row-amt"><div class="due-txt ${info.cls}">${esc(info.text)}</div><div class="who">${waiting ? '<span class="tag-wait">Waiting</span>' : done ? '' : esc(info.cls === 'later' ? '' : shortDate(r.due_date))}</div></div>
+  </button>`;
+}
+function dueStrip() {
+  const due = activeRems().filter((r) => daysUntil(r.due_date) <= 30);
+  if (!due.length) return '';
+  const show = due.slice(0, 3);
+  return `<div class="due-strip"><div class="strip-head"><span>Due soon</span><button data-allrem>${due.length > 3 ? `All ${due.length}` : 'Reminders'} ›</button></div>
+    <div class="card">${show.map(remRow).join('')}</div></div>`;
+}
+function renderBadge() {
+  const b = document.getElementById('remBadge');
+  if (!b) return;
+  const n = activeRems().filter((r) => daysUntil(r.due_date) <= 0).length;
+  b.textContent = n; b.classList.toggle('hidden', !n);
+}
+function renderRems() {
+  const el = document.getElementById('rem');
+  if (!el) return;
+  const all = Object.values(S.reminders);
+  if (!all.length) {
+    el.innerHTML = `<div class="empty"><h2>No reminders yet</h2>Tap <b>Add reminder</b> for things like the river licence, insurance, the engine service or the safety certificate.<br><br>You'll both get a phone notification 30 days before and on the day.</div>`;
+    return;
+  }
+  const act = activeRems();
+  const late = act.filter((r) => daysUntil(r.due_date) < 0);
+  const soon = act.filter((r) => { const d = daysUntil(r.due_date); return d >= 0 && d <= 30; });
+  const later = act.filter((r) => daysUntil(r.due_date) > 30);
+  const done = all.filter((r) => r.done_at).sort((a, b) => b.done_at - a.done_at);
+  const sec = (title, list, cls = '') => (list.length ? `<div class="sec-title ${cls}"><span>${title}</span><span>${list.length}</span></div><div class="card">${list.map(remRow).join('')}</div>` : '');
+  let html = '';
+  if (!pref.get('pushAsked', '') && !pushOn()) {
+    html += `<div class="note-box">Phone notifications are off on this phone. Turn them on in <b>Settings</b> to get a nudge 30 days before and on the day.</div>`;
+  }
+  html += sec('Overdue', late, 'late') + sec('Due in the next 30 days', soon) + sec('Later', later) + sec('Done', done);
+  el.innerHTML = html;
+}
+
+function openRem(id) {
+  const existing = id ? S.reminders[id] : null;
+  if (id && !existing) return;
+  const r = existing || { id: uid(), name: '', category_id: '', kind: 'repeat', due_date: '', every_months: 12, notes: '' };
+  let kind = r.kind;
+  const cats = sortedCats(false);
+  if (r.category_id && S.cats[r.category_id] && S.cats[r.category_id].hidden) cats.push(S.cats[r.category_id]);
+  const done = existing && existing.done_at;
+  const meta = existing
+    ? `Added by ${esc(existing.created_by || '?')}${existing.created_at ? ', ' + esc(fmtStamp(existing.created_at)) : ''}` +
+      (existing.last_done_date ? `<br>Last done ${esc(shortDate(existing.last_done_date))}` : '') +
+      (done ? `<br>Marked done by ${esc(existing.done_by || '?')}, ${esc(fmtStamp(existing.done_at))}` : '')
+    : '';
+
+  const sh = openSheet({
+    title: existing ? 'Reminder' : 'New reminder',
+    right: 'Save', onRight: () => save(),
+    body: `
+      <p class="form-error hidden" id="rErr"></p>
+      <div class="group">
+        <div class="field" id="rNameW"><label for="rName">What's it for?</label>
+          <input id="rName" value="${esc(r.name)}" placeholder="e.g. River licence" autocomplete="off"></div>
+        <div class="seg" id="rKind"><button data-k="repeat">Repeats</button><button data-k="once">One-off</button></div>
+        <div class="field" id="rDueW"><label for="rDue" id="rDueL"></label>
+          <input id="rDue" type="date" value="${esc(r.due_date)}"></div>
+        <div class="field" id="rEveryW"><label for="rEvery">Repeat every</label>
+          <div class="every"><input id="rEvery" inputmode="numeric" value="${esc(r.every_months || 12)}"><span>months</span></div></div>
+        <p class="hint" id="rHint"></p>
+      </div>
+      <div class="group">
+        <div class="field"><label for="rCat">Category</label>
+          <select id="rCat"><option value="">None</option>
+            ${cats.map((c) => `<option value="${esc(c.id)}" ${c.id === r.category_id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}
+          </select></div>
+        <div class="field"><label for="rNotes">Notes</label>
+          <textarea id="rNotes" placeholder="Optional, e.g. policy number or who to call">${esc(r.notes)}</textarea></div>
+      </div>
+      ${meta ? `<p class="meta-line">${meta}</p>` : ''}
+      ${existing && !done ? `<button class="btn done-btn" id="rDone">Mark done</button>` : ''}
+      ${done ? `<button class="btn plain" id="rUndone">Mark not done</button>` : ''}
+      ${existing ? `<button class="btn danger" id="rDel">Delete reminder</button>` : `<button class="btn primary" id="rSave">Save reminder</button>`}`,
+  });
+  const $ = (s) => sh.querySelector(s);
+  const drawKind = () => {
+    sh.querySelectorAll('#rKind button').forEach((b) => b.classList.toggle('on', b.dataset.k === kind));
+    $('#rEveryW').classList.toggle('hidden', kind !== 'repeat');
+    $('#rDueL').textContent = kind === 'repeat' ? 'Next due' : 'Due date';
+    $('#rHint').textContent = kind === 'repeat'
+      ? 'Use 12 for yearly. Marking it done moves it on to the next date.'
+      : 'Marking it done moves it to the Done list.';
+  };
+  $('#rKind').onclick = (e) => { const b = e.target.closest('[data-k]'); if (b) { kind = b.dataset.k; drawKind(); } };
+  drawKind();
+  if (!existing) setTimeout(() => $('#rName').focus(), 250);
+
+  function fail(msg, w) {
+    sh.querySelectorAll('.field.err').forEach((x) => x.classList.remove('err'));
+    if (w) $(w).classList.add('err');
+    const e = $('#rErr'); e.textContent = msg; e.classList.remove('hidden');
+    sh.querySelector('.sheet-body').scrollTop = 0;
+  }
+  function read() {
+    const name = $('#rName').value.trim();
+    const due = $('#rDue').value;
+    const every = parseInt($('#rEvery').value, 10);
+    if (!name) { fail('Say what the reminder is for', '#rNameW'); return null; }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(due)) { fail('Choose the due date', '#rDueW'); return null; }
+    if (kind === 'repeat' && !(every >= 1 && every <= 120)) { fail('Repeat every 1 to 120 months', '#rEveryW'); return null; }
+    const anchor = existing && existing.due_date === due && existing.anchor_day ? existing.anchor_day : +due.slice(8, 10);
+    return { name, kind, due_date: due, every_months: kind === 'repeat' ? every : null, anchor_day: anchor,
+      category_id: $('#rCat').value || null, notes: $('#rNotes').value.trim(),
+      last_done_date: (existing && existing.last_done_date) || null, done: kind === 'once' && !!done };
+  }
+  function put(rec, extra = {}) {
+    const now = Date.now();
+    S.reminders[r.id] = Object.assign({}, existing || { id: r.id, created_by: S.auth.user, created_at: now }, rec,
+      { done_at: rec.done ? ((existing && existing.done_at) || now) : null, done_by: rec.done ? ((existing && existing.done_by) || S.auth.user) : null },
+      existing ? { updated_by: S.auth.user, updated_at: now } : {}, extra);
+    queue({ t: 'rem', id: r.id, rec });
+    saveData();
+  }
+  function save() {
+    const rec = read();
+    if (!rec) return;
+    put(rec);
+    closeSheet(); renderList(); renderStatus();
+    toast(navigator.onLine ? 'Saved' : 'Saved — will sync when you have signal');
+    sync();
+  }
+
+  if (existing) {
+    $('#rDel').onclick = async () => {
+      if (!(await askConfirm('Delete this reminder?', `${r.name}. This removes it from both phones.`, 'Delete', true))) return;
+      const neverSent = !existing.seq;
+      S.outbox = S.outbox.filter((o) => o.sending || o.id !== r.id);
+      delete S.reminders[r.id];
+      if (!neverSent) queue({ t: 'remdel', id: r.id }); else saveOutbox();
+      saveData(); closeSheet(); renderList(); renderStatus();
+      toast('Deleted');
+      sync();
+    };
+  } else {
+    $('#rSave').onclick = () => save();
+  }
+  if (existing && !done) {
+    $('#rDone').onclick = async () => {
+      const rec = read();
+      if (!rec) return;
+      const t = today();
+      let msg;
+      if (rec.kind === 'repeat') {
+        let next = rec.due_date;
+        do { next = addMonths(next, rec.every_months, rec.anchor_day); } while (next <= t);
+        rec.due_date = next;
+        rec.last_done_date = t;
+        msg = `Done. Next due ${shortDate(next)}`;
+      } else {
+        rec.done = true;
+        rec.last_done_date = t;
+        msg = 'Done';
+      }
+      put(rec);
+      closeSheet(); renderList(); renderStatus();
+      toast(msg, 3200);
+      sync();
+      if (await askConfirm('Log the spend now?', `Add what “${rec.name}” cost to your spends.`, 'Log the spend')) {
+        openEdit(null, { description: rec.name, category_id: rec.category_id && S.cats[rec.category_id] && !S.cats[rec.category_id].hidden ? rec.category_id : '' });
+      }
+    };
+  }
+  if (done) {
+    $('#rUndone').onclick = () => {
+      const rec = read();
+      if (!rec) return;
+      rec.done = false;
+      put(rec);
+      closeSheet(); renderList(); renderStatus();
+      toast('Moved back to the list');
+      sync();
+    };
+  }
+}
+
+// ---------------------------------------------------------------- notifications + calendar
+const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+const pushOn = () => pushSupported() && Notification.permission === 'granted' && pref.get('pushOn', '') === '1';
+const isIOS = () => /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isStandalone = () => window.navigator.standalone === true || (window.matchMedia && matchMedia('(display-mode: standalone)').matches);
+function keyBytes(b64u) {
+  const s = b64u.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((b64u.length + 3) % 4);
+  return Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+}
+async function currentSub() {
+  if (!pushSupported()) return null;
+  const reg = await navigator.serviceWorker.getRegistration();
+  return reg ? reg.pushManager.getSubscription() : null;
+}
+async function turnOnPush() {
+  pref.set('pushAsked', '1');
+  const perm = await Notification.requestPermission(); // first, while the tap still counts
+  if (perm !== 'granted') {
+    throw new Error(perm === 'denied'
+      ? 'Notifications are blocked for Boat Costs. Allow them in the iPhone Settings app under Notifications → Boat Costs.'
+      : 'Notifications were not allowed.');
+  }
+  const { key } = await api('GET', '/push/key');
+  if (!key) throw new Error('The server is not set up for notifications yet');
+  const reg = await navigator.serviceWorker.ready;
+  let sub = await reg.pushManager.getSubscription();
+  if (sub && pref.get('pushKey', '') !== key) { await sub.unsubscribe().catch(() => {}); sub = null; }
+  if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(key) });
+  await api('POST', '/push/subscribe', sub.toJSON());
+  pref.set('pushKey', key); pref.set('pushOn', '1');
+}
+async function turnOffPush() {
+  const sub = await currentSub();
+  if (sub) { await api('DELETE', '/push/subscribe', { endpoint: sub.endpoint }).catch(() => {}); await sub.unsubscribe().catch(() => {}); }
+  pref.set('pushOn', '');
+}
+// Re-send this phone's subscription once a session, in case the server dropped it.
+let pushRefreshed = false;
+async function refreshPush() {
+  if (pushRefreshed || !pushOn()) return;
+  try {
+    const sub = await currentSub();
+    if (!sub) { pref.set('pushOn', ''); return; }
+    await api('POST', '/push/subscribe', sub.toJSON());
+    pushRefreshed = true;
+  } catch {}
+}
+
+function notifyGroup() {
+  if (!pushSupported()) {
+    const msg = isIOS() && !isStandalone()
+      ? 'Open Boat Costs from its home-screen icon to turn notifications on.'
+      : 'This phone or browser can’t show notifications from Boat Costs. iPhones need iOS 16.4 or later, opened from the home-screen icon.';
+    return `<div class="list-item"><div class="li-main">Off<small>${esc(msg)}</small></div></div>`;
+  }
+  if (pushOn()) {
+    return `<div class="list-item"><div class="li-main">On for this phone<small>30 days before and on the due date, at 9am</small></div><button class="mini" id="stTest">Send test</button></div>
+      <div class="list-item"><div class="li-main">Turn off on this phone</div><button class="mini muted" id="stPushOff">Turn off</button></div>`;
+  }
+  const blocked = Notification.permission === 'denied';
+  return `<div class="list-item"><div class="li-main">Off<small>${blocked ? 'Blocked — allow them in the iPhone Settings app under Notifications → Boat Costs' : 'Get a nudge 30 days before and on the due date, at 9am'}</small></div>${blocked ? '' : '<button class="mini" id="stPushOn">Turn on</button>'}</div>`;
+}
+
+async function openCalendar() {
+  try {
+    const { url } = await api('GET', '/calendar-link');
+    const webcal = url.replace(/^https?:/, 'webcal:');
+    pref.set('calUrl', url);
+    location.href = webcal;
+  } catch (e) {
+    toast(e.network ? 'Needs signal to set up the calendar' : e.message, 3500);
+  }
+}
+async function copyCalendar() {
+  try {
+    const url = pref.get('calUrl', '') || (await api('GET', '/calendar-link')).url;
+    pref.set('calUrl', url);
+    await navigator.clipboard.writeText(url);
+    toast('Calendar link copied');
+  } catch (e) { toast(e.network ? 'Needs signal' : 'Could not copy the link'); }
+}
+
 // ---------------------------------------------------------------- filter sheet
 function openFilter() {
   const f = Object.assign({}, S.filter);
@@ -1260,6 +1584,13 @@ function openSettings() {
       <div class="group">
         <div class="list-item"><div class="li-main">${esc(s.long)}<small>${S.sync.last ? 'Last synced ' + esc(fmtStamp(S.sync.last)) : 'Not synced yet this session'}</small></div><button class="mini" id="stSync">Sync now</button></div>
       </div>
+      <div class="group-title">Reminder notifications</div>
+      <div class="group">${notifyGroup()}</div>
+      <div class="group-title">Calendar</div>
+      <div class="group">
+        <div class="list-item"><div class="li-main">Subscribe in Calendar<small>Reminders show as all-day events, with no alerts</small></div><button class="mini" id="stCal">Subscribe</button></div>
+        <div class="list-item"><div class="li-main">Calendar link<small>For a laptop or another calendar app</small></div><button class="mini muted" id="stCalCopy">Copy</button></div>
+      </div>
       <div class="group-title">Categories</div>
       <div class="group">
         <button class="list-item" id="stCats" style="width:100%;border:0;background:transparent;text-align:left"><div class="li-main">Manage categories<small>Add your own, rename or hide</small></div><span style="color:var(--faint)">›</span></button>
@@ -1267,6 +1598,21 @@ function openSettings() {
       <button class="btn danger" id="stOut">Sign out of this phone</button>
       <p class="meta-line" style="margin-top:18px">Boat Costs ${VERSION}</p>`,
   });
+  const $s = (q) => sh.querySelector(q);
+  if ($s('#stPushOn')) $s('#stPushOn').onclick = (e) => {
+    e.target.disabled = true; e.target.textContent = 'Asking…';
+    turnOnPush().then(() => { toast('Notifications are on for this phone'); openSettings(); renderList(); })
+      .catch((err) => { toast(err.network ? 'Needs signal to turn on' : err.message, 5000); openSettings(); });
+  };
+  if ($s('#stPushOff')) $s('#stPushOff').onclick = () => turnOffPush().then(() => { toast('Notifications off for this phone'); openSettings(); renderList(); });
+  if ($s('#stTest')) $s('#stTest').onclick = async (e) => {
+    e.target.disabled = true;
+    try { const sub = await currentSub(); await api('POST', '/push/test', { endpoint: sub && sub.endpoint }); toast('Sent — it should arrive in a few seconds'); }
+    catch (err) { toast(err.network ? 'Needs signal' : err.message, 5000); if (err.status === 404 || err.status === 502) { pref.set('pushOn', ''); openSettings(); } }
+    e.target.disabled = false;
+  };
+  $s('#stCal').onclick = openCalendar;
+  $s('#stCalCopy').onclick = copyCalendar;
   sh.querySelector('#stLock').onclick = lockNow;
   sh.querySelector('#stSync').onclick = () => sync().then(openSettings);
   sh.querySelector('#stCats').onclick = openCategories;
@@ -1325,10 +1671,17 @@ window.addEventListener('online', () => { S.sync.offline = false; if (S.unlocked
 window.addEventListener('offline', () => { S.sync.offline = true; renderStatus(); });
 setInterval(() => { if (S.unlocked && document.visibilityState === 'visible') sync(); }, POLL_MS);
 
+// A tapped notification brings the app forward on the Reminders tab.
+if ('serviceWorker' in navigator) navigator.serviceWorker.addEventListener('message', (e) => {
+  if (e.data && e.data.open === 'reminders') { if (document.querySelector('.top')) setView('rem'); else { S.view = 'rem'; pref.set('view', 'rem'); } }
+});
+
 async function start() {
-  if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
+  if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('sw.js').catch(() => {});
   await loadLocal();
-  S.view = pref.get('view', 'list') === 'dash' ? 'dash' : 'list';
+  const v = pref.get('view', 'list');
+  S.view = ['dash', 'rem'].includes(v) ? v : 'list';
+  if (location.hash === '#reminders') { S.view = 'rem'; history.replaceState(null, '', location.pathname + location.search); }
   S.auth = readAuth();
   if (S.auth && S.auth.token && S.auth.hash) showLock('unlock');
   else showLock('signin', S.auth ? 'Please sign in again with your passcode.' : '');
