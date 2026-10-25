@@ -1,10 +1,11 @@
 /* Boat Costs — phone app
    Spends, categories, receipt photos, passcode lock, offline queue + sync,
-   dashboard + CSV export, reminders with notifications and a calendar feed. */
+   dashboard + CSV export, reminders with notifications and a calendar feed,
+   regular payments (spends added automatically on a schedule). */
 (() => {
 'use strict';
 
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
 const API = String((window.BOAT_CONFIG && window.BOAT_CONFIG.apiUrl) || '').replace(/\/+$/, '');
 const LOCK_AFTER_MS = 5 * 60 * 1000;     // lock again after 5 minutes in the background
 const POLL_MS = 30 * 1000;               // check for the other phone's changes every 30 s
@@ -91,7 +92,7 @@ const idb = (() => {
 const S = {
   auth: null,          // { user, token, salt, hash, len }
   unlocked: false,
-  cats: {}, spends: {}, photos: {}, reminders: {}, seq: 0,
+  cats: {}, spends: {}, photos: {}, reminders: {}, regulars: {}, seq: 0,
   outbox: [],
   filter: { q: '', cat: '', from: '', to: '', est: false },
   view: 'list',            // 'list', 'rem' or 'dash'
@@ -115,7 +116,7 @@ let saveTimer = null;
 function saveData() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    idb.set('kv', 'data', { cats: S.cats, spends: S.spends, photos: S.photos, reminders: S.reminders, seq: S.seq }).catch(() => {});
+    idb.set('kv', 'data', { cats: S.cats, spends: S.spends, photos: S.photos, reminders: S.reminders, regulars: S.regulars, seq: S.seq }).catch(() => {});
   }, 250);
 }
 function saveOutbox() {
@@ -124,9 +125,9 @@ function saveOutbox() {
 async function loadLocal() {
   try {
     const d = await idb.get('kv', 'data');
-    if (d) Object.assign(S, { cats: d.cats || {}, spends: d.spends || {}, photos: d.photos || {}, reminders: d.reminders || {}, seq: d.seq || 0 });
+    if (d) Object.assign(S, { cats: d.cats || {}, spends: d.spends || {}, photos: d.photos || {}, reminders: d.reminders || {}, regulars: d.regulars || {}, seq: d.seq || 0 });
     // Phones that synced before reminders existed need one full re-sync to pick them up.
-    if (d && !d.reminders) S.seq = 0;
+    if (d && (!d.reminders || !d.regulars)) S.seq = 0;
     S.outbox = (await idb.get('kv', 'outbox')) || [];
   } catch (e) { /* private mode etc. — run from memory */ }
 }
@@ -166,7 +167,7 @@ async function api(method, path, body, { raw = false, timeout = 20000 } = {}) {
 function pendingIds() { return new Set(S.outbox.map((o) => o.id).concat(S.outbox.map((o) => o.spend).filter(Boolean))); }
 
 function queue(op) {
-  const i = S.outbox.findIndex((o) => !o.sending && o.t === op.t && o.id === op.id && (op.t === 'spend' || op.t === 'cat' || op.t === 'rem'));
+  const i = S.outbox.findIndex((o) => !o.sending && o.t === op.t && o.id === op.id && (op.t === 'spend' || op.t === 'cat' || op.t === 'rem' || op.t === 'reg'));
   if (i >= 0) S.outbox[i] = op; else S.outbox.push(op);
   saveOutbox();
 }
@@ -192,6 +193,11 @@ async function sendOp(op) {
     if (!S.outbox.some((o) => o !== op && o.id === op.id)) { S.reminders[op.id] = row; saveData(); }
   } else if (op.t === 'remdel') {
     await api('DELETE', '/reminders/' + op.id);
+  } else if (op.t === 'reg') {
+    const row = await api('PUT', '/regulars/' + op.id, op.rec);
+    if (!S.outbox.some((o) => o !== op && o.id === op.id)) { const { added, repriced, ...g } = row; S.regulars[op.id] = g; saveData(); }
+  } else if (op.t === 'regdel') {
+    await api('DELETE', '/regulars/' + op.id);
   }
 }
 
@@ -199,6 +205,9 @@ function rejected(op, e) {
   if (op.t === 'spend' && e.status === 409) {
     removeSpendLocally(op.id);
     toast('A spend you edited had been deleted on the other phone');
+  } else if (op.t === 'reg' && e.status === 409) {
+    delete S.regulars[op.id]; saveData();
+    toast('A regular payment you edited had been deleted on the other phone');
   } else if (op.t === 'rem' && e.status === 409) {
     delete S.reminders[op.id]; saveData();
     toast('A reminder you edited had been deleted on the other phone');
@@ -237,6 +246,10 @@ async function pull() {
     if (p.deleted) { delete S.photos[p.id]; idb.del('blobs', p.id).catch(() => {}); }
     else S.photos[p.id] = Object.assign({}, S.photos[p.id], p, { pending: undefined });
   });
+  (d.regulars || []).forEach((g) => {
+    if (g.deleted) { delete S.regulars[g.id]; S.outbox = S.outbox.filter((o) => o.id !== g.id || o.sending); }
+    else if (!pend.has(g.id)) S.regulars[g.id] = g;
+  });
   (d.reminders || []).forEach((r) => {
     if (r.deleted) { delete S.reminders[r.id]; S.outbox = S.outbox.filter((o) => o.id !== r.id || o.sending); }
     else if (!pend.has(r.id)) S.reminders[r.id] = r;
@@ -268,7 +281,7 @@ function sync() {
       S.sync.error = e.network ? '' : e.message;
     } finally {
       S.sync.busy = false; syncing = null;
-      renderStatus(); renderList();
+      renderStatus(); renderList(); refreshRegGroup();
     }
   })();
   return syncing;
@@ -510,7 +523,7 @@ function renderSpendList() {
         <div class="date-badge"><div class="d num">${d.getDate()}</div><div class="w">${d.toLocaleDateString('en-GB', { weekday: 'short' })}</div></div>
         <div class="row-main">
           <div class="row-title">${esc(s.description)}</div>
-          <div class="row-sub">${s.estimated ? '<span class="tag-est">Est.</span>' : ''}${nPh ? I.clip : ''}<span>${sub}</span></div>
+          <div class="row-sub">${s.estimated ? '<span class="tag-est">Est.</span>' : ''}${s.regular_id ? `<span class="rp-ico" title="Regular payment">${I.repeat}</span>` : ''}${nPh ? I.clip : ''}<span>${sub}</span></div>
         </div>
         <div class="row-amt"><div class="a num">${money(s.amount_pence)}</div><div class="who">${waiting ? `<span class="tag-wait">Waiting</span>` : esc(s.created_by || '')}</div></div>
       </button>`;
@@ -870,13 +883,14 @@ function exportCsv(year) {
   const rows = allSpends()
     .filter((s) => !year || yearOf(s) === year)
     .sort((a, b) => a.date.localeCompare(b.date) || (a.created_at || 0) - (b.created_at || 0));
-  const head = ['Date', 'What', 'Supplier', 'Category', 'Cost (£)', 'Estimated', 'Notes', 'Receipts & bills', 'Added by', 'Added on', 'Last changed by', 'Last changed on'];
+  const head = ['Date', 'What', 'Supplier', 'Category', 'Cost (£)', 'Estimated', 'Regular payment', 'Notes', 'Receipts & bills', 'Added by', 'Added on', 'Last changed by', 'Last changed on'];
   const lines = [head.map(csvCell).join(',')];
   rows.forEach((s) => {
     const changed = s.updated_at && s.created_at && s.updated_at !== s.created_at;
     lines.push([
       ukDate(s.date), s.description, s.supplier || '', s.category_id ? catName(s.category_id) : '',
-      (s.amount_pence / 100).toFixed(2), s.estimated ? 'Yes' : 'No', s.notes || '', photosFor(s.id).length,
+      (s.amount_pence / 100).toFixed(2), s.estimated ? 'Yes' : 'No',
+      s.regular_id ? ((S.regulars[s.regular_id] && S.regulars[s.regular_id].description) || 'Yes') : '', s.notes || '', photosFor(s.id).length,
       s.created_by || '', ukStamp(s.created_at), changed ? s.updated_by || '' : '', changed ? ukStamp(s.updated_at) : '',
     ].map(csvCell).join(','));
   });
@@ -1045,8 +1059,10 @@ function openEdit(id, prefill) {
     return [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 40).map(([v]) => `<option value="${esc(v)}">`).join('');
   };
 
+  const regOf = existing && existing.regular_id ? S.regulars[existing.regular_id] : null;
   const metaLine = existing
-    ? `Added by ${esc(existing.created_by || '?')}${existing.created_at ? ', ' + esc(fmtStamp(existing.created_at)) : ''}` +
+    ? (existing.regular_id ? `Added automatically by the regular payment${regOf ? ' “' + esc(regOf.description) + '”' : ''}${existing.manual ? ' (edited since)' : ''}<br>` : '') +
+      `Added by ${esc(existing.created_by || '?')}${existing.created_at ? ', ' + esc(fmtStamp(existing.created_at)) : ''}` +
       (existing.updated_by && existing.updated_at && existing.updated_at !== existing.created_at ? `<br>Last changed by ${esc(existing.updated_by)}, ${esc(fmtStamp(existing.updated_at))}` : '')
     : '';
 
@@ -1200,8 +1216,12 @@ function openEdit(id, prefill) {
     if (category_id) pref.set('lastCat', category_id);
 
     const rec = { date, description, supplier: $('#fSup').value.trim(), amount_pence: amount, category_id: category_id || null, notes: $('#fNotes').value.trim(), estimated: $('#fEst').checked ? 1 : 0 };
+    const photoChange = form.photos.some((p) => (!p.existing && !p.removed) || (p.existing && p.removed));
+    if (existing && !photoChange && Object.keys(rec).every((k) => (rec[k] ?? null) === (existing[k] ?? null) || (k === 'estimated' && !rec[k] === !existing[k]))) {
+      closeSheet(); return; // nothing changed (keeps regular payments linked to price changes)
+    }
     const now = Date.now();
-    S.spends[s.id] = Object.assign({}, existing || { id: s.id, created_by: S.auth.user, created_at: now }, rec, existing ? { updated_by: S.auth.user, updated_at: now } : {});
+    S.spends[s.id] = Object.assign({}, existing || { id: s.id, created_by: S.auth.user, created_at: now }, rec, existing ? { updated_by: S.auth.user, updated_at: now } : {}, existing && existing.regular_id ? { manual: 1 } : {});
     queue({ t: 'spend', id: s.id, rec });
 
     for (const p of form.photos) {
@@ -1434,6 +1454,249 @@ function openRem(id) {
   }
 }
 
+// ---------------------------------------------------------------- regular payments
+// Same date rules as the server: first date on or after the start; short months use their last day.
+const FREQ_STEP = { month: 1, quarter: 3, year: 12 };
+const FREQ_NAME = { month: 'Monthly', quarter: 'Quarterly', year: 'Yearly' };
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+const ordinal = (n) => n + (n % 100 >= 11 && n % 100 <= 13 ? 'th' : ['th', 'st', 'nd', 'rd'][n % 10] || 'th');
+function onDay(y, m, day) { const t = new Date(y, m - 1, 1); return isoDate(new Date(t.getFullYear(), t.getMonth(), Math.min(day, daysIn(t.getFullYear(), t.getMonth())))); }
+function regularDates(g, upto, limit = 1200) {
+  const step = FREQ_STEP[g.freq];
+  if (!step || !g.start_date) return [];
+  let y = +g.start_date.slice(0, 4), m = g.freq === 'year' ? g.month : +g.start_date.slice(5, 7);
+  if (onDay(y, m, g.day) < g.start_date) { if (g.freq === 'year') y += 1; else m += 1; }
+  const out = [];
+  for (let k = 0; k < limit; k++) {
+    if (g.end_kind === 'count' && k >= g.end_count) break;
+    const d = onDay(y, m + k * step, g.day);
+    if (upto && d > upto) break;
+    if (g.end_kind === 'date' && g.end_date && d > g.end_date) break;
+    out.push(d);
+  }
+  return out;
+}
+const nextRegular = (g) => (g.stopped_at ? null : regularDates(g, null, 1200).find((d) => d > today()) || null);
+const amountOn = (amounts, date) => { let p = amounts.length ? amounts[0].pence : 0; amounts.forEach((a) => { if (a.from <= date) p = a.pence; }); return p; };
+const currentAmount = (g) => amountOn(g.amounts || [], nextRegular(g) || today());
+function scheduleText(g) {
+  const when = g.freq === 'year' ? `on ${g.day} ${MONTH_NAMES[g.month - 1]}` : `on the ${ordinal(g.day)}`;
+  return `${FREQ_NAME[g.freq]} ${when}`;
+}
+function endText(g) {
+  if (g.end_kind === 'date') return 'until ' + shortDate(g.end_date);
+  if (g.end_kind === 'count') return `${g.end_count} payment${g.end_count === 1 ? '' : 's'}`;
+  return 'until stopped';
+}
+const regSpends = (gid) => Object.values(S.spends).filter((s) => s.regular_id === gid);
+
+function bindRegGroup() {
+  const box = document.getElementById('stRegGroup');
+  if (!box) return;
+  box.querySelectorAll('[data-reg]').forEach((b) => { b.onclick = () => openRegular(b.dataset.reg); });
+  const add = box.querySelector('#stRegAdd');
+  if (add) add.onclick = () => openRegular(null);
+}
+// Keep the Settings list current while it's open (payments arrive after a sync).
+function refreshRegGroup() {
+  const box = document.getElementById('stRegGroup');
+  if (!box) return;
+  box.innerHTML = regularsGroup();
+  bindRegGroup();
+}
+function regularsGroup() {
+  const list = Object.values(S.regulars).sort((a, b) => !!a.stopped_at - !!b.stopped_at || a.description.localeCompare(b.description));
+  const rows = list.map((g) => {
+    const next = nextRegular(g);
+    const n = regSpends(g.id).length;
+    const sub = g.stopped_at ? `Stopped · ${n} added` : `${scheduleText(g)} · ${next ? 'next ' + shortDate(next) : 'finished'} · ${n} added`;
+    return `<button class="list-item" data-reg="${esc(g.id)}" style="width:100%;border:0;background:transparent;text-align:left">
+      <div class="li-main" style="${g.stopped_at ? 'color:var(--faint)' : ''}">${esc(g.description)}<small>${esc(sub)}</small></div>
+      <span class="num" style="font-weight:600;${g.stopped_at ? 'color:var(--faint)' : ''}">${money(currentAmount(g))}</span><span style="color:var(--faint)">›</span></button>`;
+  }).join('');
+  return rows + `<div class="list-item"><div class="li-main">${list.length ? 'Add another' : 'Mooring fees, insurance by direct debit and so on'}<small>Added to your spends automatically on the day</small></div><button class="mini" id="stRegAdd">Add</button></div>`;
+}
+
+function openRegular(id) {
+  const existing = id ? S.regulars[id] : null;
+  if (id && !existing) return;
+  const g = existing ? JSON.parse(JSON.stringify(existing)) : {
+    id: uid(), description: '', supplier: '', category_id: S.cats['cat-mooring'] && !S.cats['cat-mooring'].hidden ? 'cat-mooring' : '', notes: '',
+    freq: 'month', day: new Date().getDate(), month: new Date().getMonth() + 1, start_date: today(), end_kind: 'never', end_date: '', end_count: 12, amounts: [],
+  };
+  let freq = g.freq, endKind = g.end_kind;
+  const stopped = existing && existing.stopped_at;
+  const cats = sortedCats(false);
+  if (g.category_id && S.cats[g.category_id] && S.cats[g.category_id].hidden) cats.push(S.cats[g.category_id]);
+  const amountRows = () => (g.amounts || []).map((a, i, arr) => `<div class="list-item"><div class="li-main">${money(a.pence)}<small>${i === 0 ? 'From the start' : 'From ' + esc(shortDate(a.from))}${i < arr.length - 1 ? ' until ' + esc(shortDate(arr[i + 1].from)) : ''}</small></div></div>`).join('');
+  const n = existing ? regSpends(g.id).length : 0;
+  const meta = existing
+    ? `Set up by ${esc(existing.created_by || '?')}${existing.created_at ? ', ' + esc(fmtStamp(existing.created_at)) : ''} · ${n} payment${n === 1 ? '' : 's'} added so far` +
+      (stopped ? `<br>Stopped by ${esc(existing.stopped_by || '?')}, ${esc(fmtStamp(existing.stopped_at))}` : '')
+    : '';
+
+  const sh = openSheet({
+    title: existing ? 'Regular payment' : 'New regular payment',
+    left: '‹ Back', onLeft: openSettings,
+    right: stopped ? '' : 'Save', onRight: () => save(),
+    body: `
+      <p class="form-error hidden" id="gErr"></p>
+      <div class="group">
+        <div class="field" id="gDescW"><label for="gDesc">What is it?</label>
+          <input id="gDesc" value="${esc(g.description)}" placeholder="e.g. Mooring fee" autocomplete="off" ${stopped ? 'disabled' : ''}></div>
+        ${existing ? '' : `<div class="field" id="gAmtW"><label for="gAmt">Amount each time</label>
+          <div class="money"><span>£</span><input id="gAmt" inputmode="decimal" placeholder="0.00" autocomplete="off"></div></div>`}
+        <div class="field"><label for="gSup">Supplier</label><input id="gSup" value="${esc(g.supplier)}" placeholder="Optional" autocomplete="off" ${stopped ? 'disabled' : ''}></div>
+        <div class="field"><label for="gCat">Category</label>
+          <select id="gCat" ${stopped ? 'disabled' : ''}><option value="">None</option>
+            ${cats.map((c) => `<option value="${esc(c.id)}" ${c.id === g.category_id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select></div>
+      </div>
+      ${existing ? `
+      <div class="group-title">Amount</div>
+      <div class="group">${amountRows()}
+        ${stopped ? '' : `<div id="gChangeW" class="hidden">
+          <div class="field" id="gNewAmtW"><label for="gNewAmt">New amount</label><div class="money"><span>£</span><input id="gNewAmt" inputmode="decimal" placeholder="0.00" autocomplete="off"></div></div>
+          <div class="field" id="gFromW"><label for="gFrom">From</label><input id="gFrom" type="date" value="${esc(nextRegular(g) || today())}"></div>
+          <p class="hint">Payments from this date use the new amount, including any already added. Earlier ones keep the old amount. Payments you've edited by hand aren't changed.</p>
+        </div>
+        <div class="list-item"><div class="li-main"></div><button class="mini" id="gChange">Change amount</button></div>`}
+      </div>
+      <div class="group-title">Schedule</div>
+      <div class="group">
+        <div class="list-item"><div class="li-main">${esc(scheduleText(g))}<small>First payment ${esc(shortDate(regularDates(g, null, 1)[0] || g.start_date))}${nextRegular(g) ? ' · next ' + esc(shortDate(nextRegular(g))) : ''}</small></div></div>
+        <p class="hint">To change how often or the day, stop this one and add a new one.</p>
+      </div>` : `
+      <div class="group-title">Schedule</div>
+      <div class="group">
+        <div class="seg" id="gFreq"><button data-f="month">Monthly</button><button data-f="quarter">Quarterly</button><button data-f="year">Yearly</button></div>
+        <div class="field" id="gDayW"><label for="gDay">Day of the month</label><div class="every"><input id="gDay" inputmode="numeric" value="${esc(g.day)}"><span id="gDayTxt"></span></div></div>
+        <div class="field" id="gMonthW"><label for="gMonth">Month</label><select id="gMonth">${MONTH_NAMES.map((mn, i) => `<option value="${i + 1}" ${i + 1 === g.month ? 'selected' : ''}>${mn}</option>`).join('')}</select></div>
+        <div class="field" id="gStartW"><label for="gStart">Starting from</label><input id="gStart" type="date" value="${esc(g.start_date)}"></div>
+        <p class="hint" id="gPreview"></p>
+      </div>`}
+      <div class="group-title">Ends</div>
+      <div class="group">
+        <div class="seg" id="gEnd"><button data-e="never">Ongoing</button><button data-e="date">On a date</button><button data-e="count">After…</button></div>
+        <div class="field" id="gEndDateW"><label for="gEndDate">Last payment on or before</label><input id="gEndDate" type="date" value="${esc(g.end_date || '')}" ${stopped ? 'disabled' : ''}></div>
+        <div class="field" id="gCountW"><label for="gCount">Number of payments</label><div class="every"><input id="gCount" inputmode="numeric" value="${esc(g.end_count || 12)}" ${stopped ? 'disabled' : ''}><span>payments</span></div></div>
+      </div>
+      <div class="group">
+        <div class="field"><label for="gNotes">Notes</label><textarea id="gNotes" placeholder="Optional — copied onto each payment" ${stopped ? 'disabled' : ''}>${esc(g.notes)}</textarea></div>
+      </div>
+      ${meta ? `<p class="meta-line">${meta}</p>` : ''}
+      ${!existing ? `<button class="btn primary" id="gSave">Save regular payment</button>` : ''}
+      ${existing && !stopped ? `<button class="btn plain" id="gStop">Stop payments</button>` : ''}
+      ${existing ? `<button class="btn danger" id="gDel">Delete regular payment</button>` : ''}
+      ${existing ? `<p class="meta-line">Stopping or deleting never removes payments already added.</p>` : ''}`,
+  });
+  const $ = (q) => sh.querySelector(q);
+
+  const readSchedule = () => existing ? g : {
+    freq, day: parseInt($('#gDay').value, 10), month: +$('#gMonth').value, start_date: $('#gStart').value,
+    end_kind: endKind, end_date: $('#gEndDate').value, end_count: parseInt($('#gCount').value, 10),
+  };
+  const drawPreview = () => {
+    if (existing) return;
+    const sc = readSchedule();
+    $('#gMonthW').classList.toggle('hidden', freq !== 'year');
+    $('#gDayW label').textContent = freq === 'year' ? 'Day' : 'Day of the month';
+    $('#gDayTxt').textContent = sc.day >= 29 && sc.day <= 31 && freq !== 'year' ? 'Short months use their last day' : '';
+    if (!(sc.day >= 1 && sc.day <= 31) || !sc.start_date) { $('#gPreview').textContent = ''; return; }
+    const first = regularDates(sc, null, 1)[0];
+    const now = regularDates(sc, today()).length;
+    $('#gPreview').textContent = first
+      ? `First payment ${shortDate(first)}.` + (now ? ` ${now} payment${now === 1 ? '' : 's'} up to today will be added when you save.` : ' Nothing to add yet.')
+      : 'No payments fall within these dates.';
+  };
+  const drawSeg = () => {
+    if (!existing) sh.querySelectorAll('#gFreq button').forEach((b) => b.classList.toggle('on', b.dataset.f === freq));
+    sh.querySelectorAll('#gEnd button').forEach((b) => { b.classList.toggle('on', b.dataset.e === endKind); b.disabled = !!stopped; });
+    $('#gEndDateW').classList.toggle('hidden', endKind !== 'date');
+    $('#gCountW').classList.toggle('hidden', endKind !== 'count');
+    drawPreview();
+  };
+  if (!existing) {
+    $('#gFreq').onclick = (e) => { const b = e.target.closest('[data-f]'); if (b) { freq = b.dataset.f; drawSeg(); } };
+    ['#gDay', '#gMonth', '#gStart'].forEach((q) => $(q).addEventListener('input', drawPreview));
+    setTimeout(() => $('#gDesc').focus(), 250);
+  }
+  $('#gEnd').onclick = (e) => { const b = e.target.closest('[data-e]'); if (b && !stopped) { endKind = b.dataset.e; drawSeg(); } };
+  ['#gEndDate', '#gCount'].forEach((q) => $(q).addEventListener('input', drawPreview));
+  drawSeg();
+  if (existing && !stopped) $('#gChange').onclick = () => { $('#gChangeW').classList.remove('hidden'); $('#gChange').closest('.list-item').classList.add('hidden'); setTimeout(() => $('#gNewAmt').focus(), 50); };
+
+  function fail(msg, w) {
+    sh.querySelectorAll('.field.err').forEach((x) => x.classList.remove('err'));
+    if (w) $(w).classList.add('err');
+    const e = $('#gErr'); e.textContent = msg; e.classList.remove('hidden');
+    sh.querySelector('.sheet-body').scrollTop = 0;
+  }
+  function build(extra = {}) {
+    const description = $('#gDesc').value.trim();
+    if (!description) return fail('Say what the payment is', '#gDescW');
+    const sc = readSchedule();
+    let amounts = (g.amounts || []).slice();
+    if (!existing) {
+      const p = parseMoney($('#gAmt').value);
+      if (p == null) return fail('Enter the amount, e.g. 350.00', '#gAmtW');
+      if (!(sc.day >= 1 && sc.day <= 31)) return fail('Day must be 1 to 31', '#gDayW');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(sc.start_date)) return fail('Choose the start date', '#gStartW');
+      amounts = [{ from: sc.start_date, pence: p }];
+    } else if (!$('#gChangeW') || $('#gChangeW').classList.contains('hidden') || !$('#gNewAmt').value.trim()) {
+      // no amount change
+    } else {
+      const p = parseMoney($('#gNewAmt').value);
+      const from = $('#gFrom').value;
+      if (p == null) return fail('Enter the new amount', '#gNewAmtW');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(from)) return fail('Choose when the new amount starts', '#gFromW');
+      amounts = amounts.filter((a) => a.from !== from).concat({ from, pence: p }).sort((a, b) => a.from.localeCompare(b.from));
+    }
+    const ek = endKind;
+    const endDate = $('#gEndDate').value, endCount = parseInt($('#gCount').value, 10);
+    if (ek === 'date' && (!/^\d{4}-\d{2}-\d{2}$/.test(endDate) || endDate < sc.start_date)) return fail('The end date must be after the start', '#gEndDateW');
+    if (ek === 'count' && !(endCount >= 1 && endCount <= 1200)) return fail('Number of payments must be 1 to 1200', '#gCountW');
+    return Object.assign({
+      description, supplier: $('#gSup').value.trim(), category_id: $('#gCat').value || null, notes: $('#gNotes').value.trim(),
+      freq: sc.freq, day: sc.day, month: sc.freq === 'year' ? sc.month : null, start_date: sc.start_date,
+      end_kind: ek, end_date: ek === 'date' ? endDate : null, end_count: ek === 'count' ? endCount : null,
+      amounts, stopped: !!stopped,
+    }, extra);
+  }
+  function put(rec) {
+    const now = Date.now();
+    const { stopped: st, ...fields } = rec;
+    S.regulars[g.id] = Object.assign({}, existing || { id: g.id, created_by: S.auth.user, created_at: now }, fields,
+      { stopped_at: st ? ((existing && existing.stopped_at) || now) : null, stopped_by: st ? ((existing && existing.stopped_by) || S.auth.user) : null },
+      existing ? { updated_by: S.auth.user, updated_at: now } : {});
+    queue({ t: 'reg', id: g.id, rec });
+    saveData();
+  }
+  function save() {
+    const rec = build();
+    if (!rec) return;
+    put(rec);
+    openSettings(); renderList(); renderStatus();
+    const due = existing ? 0 : regularDates(rec, today()).length;
+    toast(!navigator.onLine ? 'Saved — payments will be added when you have signal' : due ? `Saved — adding ${due} payment${due === 1 ? '' : 's'}` : 'Saved', 3200);
+    sync();
+  }
+  if (!existing) $('#gSave').onclick = save;
+  if (existing && !stopped) $('#gStop').onclick = async () => {
+    if (!(await askConfirm('Stop this regular payment?', `${g.description}: no more payments will be added. The ${n} already added stay.`, 'Stop payments', true))) return;
+    const rec = build({ stopped: true });
+    if (!rec) return;
+    put(rec); openSettings(); renderList(); renderStatus(); toast('Stopped'); sync();
+  };
+  if (existing) $('#gDel').onclick = async () => {
+    if (!(await askConfirm('Delete this regular payment?', `${g.description}: it's removed from the list and no more payments are added. The ${n} already added stay in your spends.`, 'Delete', true))) return;
+    const neverSent = !existing.seq;
+    S.outbox = S.outbox.filter((o) => o.sending || o.id !== g.id);
+    delete S.regulars[g.id];
+    if (!neverSent) queue({ t: 'regdel', id: g.id }); else saveOutbox();
+    saveData(); openSettings(); renderList(); renderStatus(); toast('Deleted'); sync();
+  };
+}
+
 // ---------------------------------------------------------------- notifications + calendar
 const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
 const pushOn = () => pushSupported() && Notification.permission === 'granted' && pref.get('pushOn', '') === '1';
@@ -1584,6 +1847,8 @@ function openSettings() {
       <div class="group">
         <div class="list-item"><div class="li-main">${esc(s.long)}<small>${S.sync.last ? 'Last synced ' + esc(fmtStamp(S.sync.last)) : 'Not synced yet this session'}</small></div><button class="mini" id="stSync">Sync now</button></div>
       </div>
+      <div class="group-title">Regular payments</div>
+      <div class="group" id="stRegGroup">${regularsGroup()}</div>
       <div class="group-title">Reminder notifications</div>
       <div class="group">${notifyGroup()}</div>
       <div class="group-title">Calendar</div>
@@ -1611,6 +1876,7 @@ function openSettings() {
     catch (err) { toast(err.network ? 'Needs signal' : err.message, 5000); if (err.status === 404 || err.status === 502) { pref.set('pushOn', ''); openSettings(); } }
     e.target.disabled = false;
   };
+  bindRegGroup();
   $s('#stCal').onclick = openCalendar;
   $s('#stCalCopy').onclick = copyCalendar;
   sh.querySelector('#stLock').onclick = lockNow;

@@ -1,6 +1,6 @@
 // Boat Costs service worker — lets the app open with no signal, and shows reminder notifications.
 // Bump VERSION whenever app files change so phones pick up the new copy.
-const VERSION = 'boat-costs-1.3.0';
+const VERSION = 'boat-costs-1.4.0';
 const FILES = ['./', 'index.html', 'app.js', 'config.js', 'manifest.webmanifest',
                'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 
